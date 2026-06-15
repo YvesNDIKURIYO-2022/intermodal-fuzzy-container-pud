@@ -1,16 +1,61 @@
-# intermodal-fuzzy-container-pud
+# A Fuzzy Multi-Objective Model for Pickup-and-Delivery Operations in Intermodal Hub-and-Spoke Container Networks Under Transit and Border Uncertainty
 
-Benchmark suite and code for fuzzy multi-objective optimization of pickup-and-delivery operations in intermodal hub-and-spoke container networks under transit and border uncertainty.
+**Python** • **MIT License** • **Paper** • **Data**
 
-## Authors
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
+[![Benchmark](https://img.shields.io/badge/benchmark-168%20instances-green.svg)](fuzzy_solomon_modified/)
+[![Paper](https://img.shields.io/badge/paper-under%20review-orange.svg)]()
 
-- **Yves Ndikuriyo** - Conceptualization, Methodology, Software, Writing – original draft
-- **Yinggui Zhang** (Corresponding Author) - Supervision, Methodology, Writing – review & editing
-- **Dung Davou Fom** - Validation, Formal analysis, Writing – review & editing
+---
 
-## Affiliations
+## Overview
 
-School of Traffic and Transportation Engineering, Central South University, Changsha 410075, China
+This repository contains the complete code, data, and analysis for the paper:
+
+> **Yves Ndikuriyo**, **Yinggui Zhang** (Corresponding Author), **Dung Davou Fom**  
+> *School of Traffic and Transportation Engineering, Central South University, Changsha, China*
+
+The paper addresses a critical gap in intermodal freight logistics: the optimization of pickup-and-delivery operations in hub-and-spoke container networks under the dual uncertainties of transit time variability and border clearance delays.
+
+### Key Contributions
+
+| Contribution | Description |
+|--------------|-------------|
+| **Methodological** | Novel FMOMILP formulation preserving full fuzzy distributional information |
+| **Algorithmic** | Adaptive α-confidence NSGA-II (Aα-NSGA-II) with co-evolved confidence levels |
+| **Empirical** | 168 modified Solomon benchmark instances and East African corridor case study |
+
+### Repository Components
+
+| Component | Description |
+|-----------|-------------|
+| `fuzzy_solomon_modified/` | 168 benchmark instances with triangular fuzzy travel times |
+| `results/` | Complete benchmark results (168 × 4 × 10 runs) |
+| `visualizations/` | Performance figures (hub balance, cost vs balance, runtime) |
+| `east_africa_results/` | Case study with 10 figures and 7 tables |
+| `src/` | Source code for all algorithms |
+
+---
+
+## Table of Contents
+
+1. [Authors](#authors)
+2. [Affiliation](#affiliation)
+3. [Repository Structure](#repository-structure)
+4. [Dataset Generation](#dataset-generation)
+5. [Benchmark Results](#benchmark-results)
+6. [East African Case Study](#east-african-case-study)
+7. [Repository Statistics](#repository-statistics)
+8. [Requirements](#requirements)
+9. [Installation](#installation)
+10. [Usage](#usage)
+11. [Citation](#citation)
+12. [License](#license)
+13. [Contact](#contact)
+14. [Acknowledgments](#acknowledgments)
+
+---
 
 ## Repository Structure
 
@@ -29,25 +74,13 @@ intermodal-fuzzy-container-pud/
 └── README.md                        # This file
 ```
 
-## Overview
-
-This repository accompanies the paper:
-
-> *"A Fuzzy Multi-Objective Model for Pickup-and-Delivery Operations in Intermodal Hub-and-Spoke Container Networks Under Transit and Border Uncertainty"*
-
-The repository contains three main components:
-
-1. **Dataset Generation** - 168 modified Solomon benchmark instances with triangular fuzzy travel times, graduated hub configurations (2, 3, 4 hubs), and pickup-and-delivery constraints.
-
-2. **Benchmark Experimentation** - Complete benchmark results for four algorithms (Aα-NSGA-II, NSGA-II, SMS-EMOA, RVEA) evaluated on hub balance, total cost, total time, and computational runtime.
-
-3. **Case Study Application** - East African corridor case study demonstrating practical effectiveness on a realistic two-hub pickup-and-delivery network.
-
 ---
 
-## Part 1: Dataset Generation
+## Dataset Generation
 
-The repository includes **168 modified Solomon instances** generated from the standard Solomon VRPTW benchmark. The generation process converts deterministic VRPTW instances into fuzzy intermodal hub-and-spoke problems with the following characteristics:
+The repository includes **168 modified Solomon instances** generated from the standard Solomon VRPTW benchmark.
+
+### Instance Specifications
 
 | Feature | Specification |
 |---------|---------------|
@@ -66,11 +99,9 @@ The repository includes **168 modified Solomon instances** generated from the st
 | `FS_R112_H3` | FS = Fuzzy Solomon, R112 = Instance name, H3 = 3 hubs |
 | `FS_RC208_H4` | FS = Fuzzy Solomon, RC208 = Instance name, H4 = 4 hubs |
 
-The generation script (`src/generate_instances.py`) parses original Solomon `.txt` files, selects hubs based on centrality, assigns spokes to nearest hubs, constructs spoke-hub and hub-hub arcs with mode-dependent travel times, and exports each instance as a JSON file.
-
 ---
 
-## Part 2: Benchmark Experimentation
+## Benchmark Results
 
 ### Algorithms Compared
 
@@ -125,7 +156,7 @@ The generation script (`src/generate_instances.py`) parses original Solomon `.tx
 
 ---
 
-## Part 3: East African Case Study
+## East African Case Study
 
 ### Network Configuration
 
@@ -189,7 +220,7 @@ The East African corridor features a realistic two-hub pickup-and-delivery netwo
 - **48% reduction** in inter-hub transfer volume (145 vs 280 TEU)
 - **24% faster convergence** (32 vs 42 generations)
 - **Near-perfect hub load balancing** (Mombasa 46.0%, Dar es Salaam 42.5%)
-- **Statistically significant** with large effect size (p < 0.05, Cohen's d = 6.36)
+- Statistically significant with large effect size (p < 0.05, Cohen's d = 6.36)
 
 ### Case Study Visualizations
 
@@ -220,9 +251,11 @@ The East African corridor features a realistic two-hub pickup-and-delivery netwo
 | East African figures | 10 PNG files |
 | East African tables | 7 CSV files |
 
+---
+
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - NumPy
 - Pandas
 - Matplotlib
@@ -237,6 +270,18 @@ cd intermodal-fuzzy-container-pud
 pip install numpy pandas matplotlib seaborn scipy
 ```
 
+## Usage
+
+```bash
+# Run benchmark
+python src/benchmark.py
+
+# Run case study
+python src/case_study.py
+```
+
+---
+
 ## Citation
 
 If you use this code or data in your research, please cite:
@@ -249,14 +294,49 @@ If you use this code or data in your research, please cite:
 }
 ```
 
+---
+
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License - see [LICENSE](LICENSE) file for details.
 
-## Contact
+---
 
-Corresponding author: Yinggui Zhang - ygzhang@csu.edu.cn
+## Authors Contact
+
+**Yves Ndikuriyo**  
+PhD Candidate, School of Traffic and Transportation Engineering  
+Central South University, Changsha, China  
+📧 [yvesndikuriyo@csu.edu.cn](mailto:yvesndikuriyo@csu.edu.cn)  
+🔗 [ORCID: 0009-0006-9324-7265](https://orcid.org/0009-0006-9324-7265)
+
+**Professor Yinggui Zhang** (Corresponding Author)  
+School of Traffic and Transportation Engineering  
+Central South University, Changsha, China  
+📧 [ygzhang@csu.edu.cn](mailto:ygzhang@csu.edu.cn)  
+🔗 [ORCID: 0000-0002-5790-0638](https://orcid.org/0000-0002-5790-0638)
+
+**Dung Davou Fom**  
+School of Traffic and Transportation Engineering  
+Central South University, Changsha, China  
+📧 [dungfom1@csu.edu.cn](mailto:dungfom1@csu.edu.cn)  
+🔗 [ORCID: 0009-0001-8688-813X](https://orcid.org/0009-0001-8688-813X)
+
+---
 
 ## Acknowledgments
 
-This work was supported by the National Natural Science Foundation of China [Grant No. 71971220] and the Natural Science Foundation of Hunan Province, China [Grant Nos. 2023JJ30710, 2022JJ31020].
+This work was supported by:
+
+- National Natural Science Foundation of China [Grant No. 71971220]
+- Natural Science Foundation of Hunan Province, China [Grant Nos. 2023JJ30710, 2022JJ31020]
+
+---
+
+<div align="center">
+  <sub>Built with Python | Fuzzy Multi-Objective Optimization for Intermodal Container Logistics | 📊 168 Benchmark Instances | 🔬 4 Algorithms (Aα-NSGA-II, NSGA-II, SMS-EMOA, RVEA) | 🌍 East African Corridor Case Study</sub>
+</div>
+
+<div align="center">
+  <sub>© 2026 Yves Ndikuriyo, Yinggui Zhang, Dung Davou Fom — Central South University, China</sub>
+</div>• Last updated: June 2026</sub>
