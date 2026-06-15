@@ -40,20 +40,35 @@ The paper addresses a critical gap in intermodal freight logistics: the optimiza
 
 ## Table of Contents
 
-1. [Authors](#authors)
-2. [Affiliation](#affiliation)
-3. [Repository Structure](#repository-structure)
-4. [Dataset Generation](#dataset-generation)
-5. [Benchmark Results](#benchmark-results)
-6. [East African Case Study](#east-african-case-study)
-7. [Repository Statistics](#repository-statistics)
-8. [Requirements](#requirements)
-9. [Installation](#installation)
-10. [Usage](#usage)
-11. [Citation](#citation)
-12. [License](#license)
-13. [Contact](#contact)
-14. [Acknowledgments](#acknowledgments)
+1. [Overview](#overview)
+2. [Authors](#authors)
+3. [Affiliation](#affiliation)
+4. [Repository Structure](#repository-structure)
+5. [Dataset Generation](#dataset-generation)
+6. [Benchmark Results](#benchmark-results)
+7. [East African Case Study](#east-african-case-study)
+8. [Repository Statistics](#repository-statistics)
+9. [Requirements](#requirements)
+10. [Installation](#installation)
+11. [Usage](#usage)
+12. [Citation](#citation)
+13. [License](#license)
+14. [Authors Contact](#authors-contact)
+15. [Acknowledgments](#acknowledgments)
+
+---
+
+## Authors
+
+- **Yves Ndikuriyo** - Conceptualization, Methodology, Software, Writing – original draft
+- **Yinggui Zhang** (Corresponding Author) - Supervision, Methodology, Writing – review & editing
+- **Dung Davou Fom** - Validation, Formal analysis, Writing – review & editing
+
+---
+
+## Affiliation
+
+School of Traffic and Transportation Engineering, Central South University, Changsha 410075, China
 
 ---
 
@@ -334,9 +349,9 @@ This work was supported by:
 ---
 
 <div align="center">
-  <sub>Built with Python | Fuzzy Multi-Objective Optimization for Intermodal Container Logistics | 📊 168 Benchmark Instances | 🔬 4 Algorithms (Aα-NSGA-II, NSGA-II, SMS-EMOA, RVEA) | 🌍 East African Corridor Case Study</sub>
+  <sub>Built with Python | Fuzzy Multi-Objective Optimization for Intermodal Container Logistics | 📊 168 Benchmark Instances | 🔬 4 Algorithms (Aα-NSGA-II, NSGA-II, SMS-EMOA, RVEA) | 🌍 East African Corridor Case Study | Last updated: June 2026</sub>
 </div>
 
 <div align="center">
   <sub>© 2026 Yves Ndikuriyo, Yinggui Zhang, Dung Davou Fom — Central South University, China</sub>
-</div>• Last updated: June 2026</sub>
+</div>
