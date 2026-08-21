@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FUZZY MULTI-OBJECTIVE MODEL FOR PUD IN INTERMODAL HS NETWORKS
-COMPLETE BENCHMARK WITH ALL REQUIRED METRICS - UPDATED VERSION
+COMPLETE BENCHMARK WITH ALL REQUIRED METRICS 
 """
 
 import numpy as np
@@ -1329,8 +1329,8 @@ def main():
     print("COMPLETE BENCHMARK WITH ALL REQUIRED METRICS")
     print("="*70)
     
-    instance_dir = r"...........\fuzzy_generated"
-    output_dir = r".............\benchmark_results"
+    instance_dir = r"........\fuzzy_generated"
+    output_dir = r"...........\benchmark_results"
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\n[1] Loading instances from: {instance_dir}")
