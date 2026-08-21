@@ -352,12 +352,12 @@ def main():
     # =========================================================
 
     input_dirs = {
-        25: r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\solomon_25",
-        50: r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\solomon_50",
-        100: r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\solomon_100"
+        25: r"....\solomon_25",
+        50: r".....\solomon_50",
+        100: r".....\solomon_100"
     }
 
-    output_dir = r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\Datasets_Generation\fuzzy_solomon_modified"
+    output_dir = r".........."
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -1607,9 +1607,6 @@ if __name__ == "__main__":
     # CONFIGURATION - EDIT THESE PATHS
     # ========================================================================
 
-    INPUT_DIR = r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD"
-    OUTPUT_DIR = r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\fuzzy_datasets"
-
     # Optional: Limit instances for testing
     # MAX_INSTANCES = 10  # Set to None for full generation
     MAX_INSTANCES = None
@@ -2535,8 +2532,8 @@ class FuzzyDatasetGenerator:
 # ============================================================================
 
 if __name__ == "__main__":
-    BASE_DIR = Path(r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\Fuzzy Datasets")
-    OUTPUT_DIR = Path(r"D:\Container Transportation Routing Problems\Manuscript5-Opt CTRouting Problem as a M2-M PUD\fuzzy_generated")
+    BASE_DIR = Path(r".......\Fuzzy Datasets")
+    OUTPUT_DIR = Path(r"......\fuzzy_generated")
 
     generator = FuzzyDatasetGenerator(base_dir=BASE_DIR, output_dir=OUTPUT_DIR, config=CONFIG, seed=42)
     results = generator.generate_all(max_instances=None)
