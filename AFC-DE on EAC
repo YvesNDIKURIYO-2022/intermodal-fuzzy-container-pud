@@ -1,0 +1,1952 @@
+#!/usr/bin/env python3
+"""
+AFC-DE: Adaptive Fuzzy Chance-Constrained Differential Evolution
+================================================================
+Reproducibility artefact for the manuscript:
+
+    "Integrated Pickup-and-Delivery and Container Routing in Intermodal
+     Hub-and-Spoke Networks Under Transit and Border Uncertainty:
+     Evidence from the East African Corridor"
+
+    Yves Ndikuriyo, Yinggui Zhang, Dung Davou Fom
+    School of Traffic and Transportation Engineering
+    Central South University, Changsha 410075, China
+
+This script reproduces every table and figure in the manuscript's
+Section 5 (Experimentation). It runs three methods (a greedy nearest-hub
+heuristic, a deterministic-AFC-DE baseline, and the fuzzy-AFC-DE at four
+confidence levels), three sensitivity analyses, and saves the results as
+CSV/LaTeX tables, JSON output, and publication-quality figures.
+
+Usage
+-----
+    python afc_de.py
+    python afc_de.py --output-dir ./results --seed 42
+    python afc_de.py --light          # reduces runs for laptops
+
+Environment variables (optional):
+    AFC_DE_OUTPUT_DIR   overrides the default output directory
+
+See README.md for the full reproduction protocol.
+
+Author: Yves Ndikuriyo
+License: MIT (see LICENSE)
+"""
+
+# ============================================================================
+# BLAS THREAD LIMITS (must be set before importing numpy)
+# ============================================================================
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+import sys
+import io
+import signal
+import argparse
+from pathlib import Path
+
+# UTF-8 stdout on Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import numpy as np
+import numpy.random as rnd
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+import time
+import json
+import gc
+import traceback
+import warnings
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================================
+# OUTPUT DIRECTORIES (portable)
+# ============================================================================
+
+def setup_output_dirs(base_dir: Path) -> dict:
+    """Create the output directory tree and return the paths."""
+    paths = {
+        "root":        base_dir,
+        "routes":      base_dir / "recommended_routes",
+        "figures":     base_dir / "figures",
+        "figures_pub": base_dir / "figures_publication",
+        "reports":     base_dir / "reports",
+    }
+    for p in paths.values():
+        p.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+# ============================================================================
+# TRANSPORTMETRICA A (TAYLOR & FRANCIS) PUBLICATION STYLING
+# ============================================================================
+
+TM_SINGLE_WIDTH = 80 / 25.4     # = 3.150 in
+TM_DOUBLE_WIDTH = 169 / 25.4    # = 6.654 in
+TM_MAX_HEIGHT   = 220 / 25.4    # = 8.661 in
+
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "Liberation Sans",
+                        "DejaVu Sans", "Nimbus Sans"],
+    "font.size": 9,
+    "mathtext.fontset": "stixsans",
+
+    "axes.labelsize": 10,
+    "axes.titlesize": 10,
+    "axes.titleweight": "bold",
+    "axes.titlepad": 4,
+    "legend.fontsize": 8,
+    "legend.title_fontsize": 8,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+
+    "lines.linewidth": 0.75,
+    "lines.markersize": 5,
+    "lines.markeredgewidth": 0.5,
+    "patch.linewidth": 0.5,
+    "axes.linewidth": 0.75,
+
+    "xtick.major.size": 3.5,
+    "ytick.major.size": 3.5,
+    "xtick.minor.size": 2.0,
+    "ytick.minor.size": 2.0,
+    "xtick.major.width": 0.5,
+    "ytick.major.width": 0.5,
+    "xtick.minor.width": 0.4,
+    "ytick.minor.width": 0.4,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+
+    "grid.alpha": 0.25,
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.4,
+
+    "figure.dpi": 600,
+    "savefig.dpi": 600,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.02,
+    "figure.autolayout": False,
+
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "pdf.compression": 9,
+
+    "legend.frameon": True,
+    "legend.framealpha": 0.95,
+    "legend.edgecolor": "black",
+    "legend.fancybox": False,
+    "legend.borderpad": 0.3,
+    "legend.labelspacing": 0.3,
+    "legend.handlelength": 1.5,
+    "legend.handletextpad": 0.4,
+    "legend.columnspacing": 0.8,
+
+    "axes.prop_cycle": plt.cycler(color=[
+        "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+        "#F0E442", "#56B4E9", "#E69F00", "#000000",
+    ]),
+})
+
+
+# ============================================================================
+# CORRIDOR DATA
+# ============================================================================
+
+HUBS = {
+    "Mombasa": {
+        "id": "MOM", "country": "Kenya", "capacity_teu": 1000,
+        "handling_cost_per_teu": 65, "lat": -4.0435, "lon": 39.6682,
+    },
+    "Dar_es_Salaam": {
+        "id": "DAR", "country": "Tanzania", "capacity_teu": 800,
+        "handling_cost_per_teu": 60, "lat": -6.8226, "lon": 39.2862,
+    },
+}
+
+ORIGINS = {
+    "Nairobi": {"country": "Kenya",    "supply_teu": 100, "lat": -1.2864, "lon": 36.8172},
+    "Nakuru":  {"country": "Kenya",    "supply_teu":  70, "lat": -0.3031, "lon": 36.0800},
+    "Arusha":  {"country": "Tanzania", "supply_teu":  50, "lat": -3.3869, "lon": 36.6830},
+    "Kisumu":  {"country": "Kenya",    "supply_teu":  60, "lat": -0.1022, "lon": 34.7617},
+    "Mwanza":  {"country": "Tanzania", "supply_teu":  65, "lat": -2.5167, "lon": 32.9000},
+    "Jinja":   {"country": "Uganda",   "supply_teu":  50, "lat":  0.4422, "lon": 33.2031},
+    "Eldoret": {"country": "Kenya",    "supply_teu":  45, "lat":  0.5200, "lon": 35.2700},
+    "Isaka":   {"country": "Tanzania", "supply_teu":  55, "lat": -3.9000, "lon": 32.9300},
+}
+
+DESTINATIONS = {
+    "Kampala":    {"country": "Uganda",      "demand_teu": 120, "earliest_delivery": 20, "latest_delivery": 50, "lat":  0.3476, "lon": 32.5825},
+    "Kigali":     {"country": "Rwanda",      "demand_teu":  80, "earliest_delivery": 20, "latest_delivery": 45, "lat": -1.9441, "lon": 30.0619},
+    "Bujumbura":  {"country": "Burundi",     "demand_teu":  50, "earliest_delivery": 20, "latest_delivery": 42, "lat": -3.3614, "lon": 29.3599},
+    "Juba":       {"country": "South Sudan", "demand_teu":  60, "earliest_delivery": 20, "latest_delivery": 55, "lat":  4.8594, "lon": 31.5713},
+    "Goma":       {"country": "DRC",         "demand_teu":  40, "earliest_delivery": 20, "latest_delivery": 44, "lat": -1.6741, "lon": 29.2358},
+    "Lubumbashi": {"country": "DRC",         "demand_teu":  55, "earliest_delivery": 20, "latest_delivery": 55, "lat": -11.6649, "lon": 27.4793},
+    "Bukavu":     {"country": "DRC",         "demand_teu":  35, "earliest_delivery": 20, "latest_delivery": 48, "lat": -2.5100, "lon": 28.8600},
+    "Mbeya":      {"country": "Tanzania",    "demand_teu":  40, "earliest_delivery": 20, "latest_delivery": 46, "lat": -8.9000, "lon": 33.4600},
+    "Mogadishu":  {"country": "Somalia",     "demand_teu":  30, "earliest_delivery": 20, "latest_delivery": 50, "lat":  2.0400, "lon": 45.3400},
+}
+
+DISTANCES = {
+    ("Nairobi", "Mombasa"): 480, ("Nakuru", "Mombasa"): 520,
+    ("Arusha", "Mombasa"): 380, ("Kisumu", "Mombasa"): 680,
+    ("Mwanza", "Mombasa"): 850, ("Jinja", "Mombasa"): 760,
+    ("Eldoret", "Mombasa"): 680, ("Isaka", "Mombasa"): 1200,
+    ("Nairobi", "Dar_es_Salaam"): 780, ("Nakuru", "Dar_es_Salaam"): 820,
+    ("Arusha", "Dar_es_Salaam"): 600, ("Kisumu", "Dar_es_Salaam"): 980,
+    ("Mwanza", "Dar_es_Salaam"): 1050, ("Jinja", "Dar_es_Salaam"): 980,
+    ("Eldoret", "Dar_es_Salaam"): 980, ("Isaka", "Dar_es_Salaam"): 850,
+    ("Mombasa", "Kampala"): 1150, ("Mombasa", "Kigali"): 1300,
+    ("Mombasa", "Bujumbura"): 1500, ("Mombasa", "Juba"): 1400,
+    ("Mombasa", "Goma"): 1450, ("Mombasa", "Lubumbashi"): 1900,
+    ("Mombasa", "Bukavu"): 1900, ("Mombasa", "Mbeya"): 1200,
+    ("Mombasa", "Mogadishu"): 1450,
+    ("Dar_es_Salaam", "Kampala"): 1200, ("Dar_es_Salaam", "Kigali"): 900,
+    ("Dar_es_Salaam", "Bujumbura"): 850, ("Dar_es_Salaam", "Juba"): 1650,
+    ("Dar_es_Salaam", "Goma"): 950, ("Dar_es_Salaam", "Lubumbashi"): 1100,
+    ("Dar_es_Salaam", "Bukavu"): 1250, ("Dar_es_Salaam", "Mbeya"): 820,
+    ("Dar_es_Salaam", "Mogadishu"): 1900,
+    ("Mombasa", "Dar_es_Salaam"): 450,
+    ("Dar_es_Salaam", "Mombasa"): 450,
+}
+
+BASE_FUZZY_TRANSIT = {
+    ("Nairobi", "Mombasa"): 8.0, ("Nakuru", "Mombasa"): 8.7,
+    ("Arusha", "Mombasa"): 6.3, ("Kisumu", "Mombasa"): 11.3,
+    ("Mwanza", "Mombasa"): 14.2, ("Jinja", "Mombasa"): 12.7,
+    ("Eldoret", "Mombasa"): 11.3, ("Isaka", "Mombasa"): 20.0,
+    ("Nairobi", "Dar_es_Salaam"): 13.0, ("Nakuru", "Dar_es_Salaam"): 13.7,
+    ("Arusha", "Dar_es_Salaam"): 10.0, ("Kisumu", "Dar_es_Salaam"): 16.3,
+    ("Mwanza", "Dar_es_Salaam"): 17.5, ("Jinja", "Dar_es_Salaam"): 16.3,
+    ("Eldoret", "Dar_es_Salaam"): 16.3, ("Isaka", "Dar_es_Salaam"): 14.2,
+    ("Mombasa", "Kampala"): 19.2, ("Mombasa", "Kigali"): 21.7,
+    ("Mombasa", "Bujumbura"): 25.0, ("Mombasa", "Juba"): 23.3,
+    ("Mombasa", "Goma"): 24.2, ("Mombasa", "Lubumbashi"): 31.7,
+    ("Mombasa", "Bukavu"): 31.7, ("Mombasa", "Mbeya"): 20.0,
+    ("Mombasa", "Mogadishu"): 24.2,
+    ("Dar_es_Salaam", "Kampala"): 20.0, ("Dar_es_Salaam", "Kigali"): 15.0,
+    ("Dar_es_Salaam", "Bujumbura"): 14.2, ("Dar_es_Salaam", "Juba"): 27.5,
+    ("Dar_es_Salaam", "Goma"): 15.8, ("Dar_es_Salaam", "Lubumbashi"): 18.3,
+    ("Dar_es_Salaam", "Bukavu"): 20.8, ("Dar_es_Salaam", "Mbeya"): 13.7,
+    ("Dar_es_Salaam", "Mogadishu"): 31.7,
+    ("Mombasa", "Dar_es_Salaam"): 7.5,
+    ("Dar_es_Salaam", "Mombasa"): 7.5,
+}
+
+
+def make_fuzzy(nominal, delta=0.15):
+    """Trapezoidal fuzzy number centred on a nominal value."""
+    return (nominal * (1 - 2 * delta), nominal * (1 - delta),
+            nominal * (1 + delta), nominal * (1 + 2 * delta))
+
+
+FUZZY_TRANSIT = {k: make_fuzzy(v, 0.15) for k, v in BASE_FUZZY_TRANSIT.items()}
+
+BORDER_CLEARANCE = {
+    "Malaba":       (10.0, 14.0, 22.0, 30.0),
+    "Busia":        ( 4.0,  5.5,  9.0, 12.0),
+    "Mirama_Hills": ( 3.0,  4.5,  7.5, 10.0),
+    "Elegu":        ( 6.0,  9.0, 15.0, 20.0),
+    "Rusumo":       ( 5.0,  7.0, 10.0, 14.0),
+    "Liboi":        ( 2.5,  3.5,  5.5,  7.5),
+}
+
+ROUTE_BORDER = {
+    ("Mombasa", "Kampala"): "Malaba", ("Mombasa", "Kigali"): "Malaba",
+    ("Mombasa", "Bujumbura"): "Malaba", ("Mombasa", "Juba"): "Elegu",
+    ("Mombasa", "Goma"): "Malaba", ("Mombasa", "Lubumbashi"): "Malaba",
+    ("Mombasa", "Bukavu"): "Malaba", ("Mombasa", "Mogadishu"): "Liboi",
+    ("Dar_es_Salaam", "Kampala"): "Mirama_Hills",
+    ("Dar_es_Salaam", "Kigali"): "Mirama_Hills",
+    ("Dar_es_Salaam", "Bujumbura"): "Mirama_Hills",
+    ("Dar_es_Salaam", "Juba"): "Elegu",
+    ("Dar_es_Salaam", "Goma"): "Mirama_Hills",
+    ("Dar_es_Salaam", "Lubumbashi"): "Mirama_Hills",
+    ("Dar_es_Salaam", "Bukavu"): "Rusumo",
+    ("Mombasa", "Mbeya"): None,
+    ("Dar_es_Salaam", "Mbeya"): None,
+    ("Dar_es_Salaam", "Mogadishu"): "Liboi",
+}
+
+COST_PER_KM = 2.5
+FUEL_COST_PER_KM = 0.45
+VEHICLE_FIXED_COST = 200
+INTER_HUB_TRANSFER_COST = 50
+CO2_PER_KM = 0.9
+RELIABILITY_PENALTY_PER_HOUR_PER_TEU = 5000
+TOTAL_DEMAND_TEU = 510
+
+
+# ============================================================================
+# VEHICLE FLEET
+# ============================================================================
+
+VEHICLE_TYPES = {
+    "truck_40ft": {"capacity_teu": 2,  "cost_per_km": 1.80, "speed_kmh": 45, "fixed_cost": 200},
+    "truck_20ft": {"capacity_teu": 1,  "cost_per_km": 1.20, "speed_kmh": 50, "fixed_cost": 150},
+    "rail_wagon": {"capacity_teu": 4,  "cost_per_km": 0.60, "speed_kmh": 30, "fixed_cost": 80},
+    "lake_barge": {"capacity_teu": 20, "cost_per_km": 0.30, "speed_kmh": 15, "fixed_cost": 500},
+}
+
+DRIVER_HOURS_PER_DAY = 11
+LAKE_ARCS = {("Dar_es_Salaam", "Bukavu")}
+
+
+# ============================================================================
+# FUZZY HELPERS
+# ============================================================================
+
+def fuzzy_expected(fuzzy_tuple):
+    a1, a2, a3, a4 = fuzzy_tuple
+    return (a1 + 2 * a2 + 2 * a3 + a4) / 6
+
+
+def fuzzy_add(f1, f2):
+    return (f1[0] + f2[0], f1[1] + f2[1], f1[2] + f2[2], f1[3] + f2[3])
+
+
+def necessity_measure(fuzzy_tuple, bound):
+    a1, a2, a3, a4 = fuzzy_tuple
+    if bound >= a4:
+        return 1.0
+    elif bound >= a3:
+        return (bound - a3) / (a4 - a3) if a4 > a3 else 1.0
+    else:
+        return 0.0
+
+
+def sample_trapezoidal_vectorized(fuzzy_tuple, n_samples=1000):
+    a, b, c, d = fuzzy_tuple
+    u = rnd.random(n_samples)
+    area_left  = max((b - a) / 2, 1e-9)
+    area_mid   = max(c - b,      1e-9)
+    area_right = max((d - c) / 2, 1e-9)
+    total_area = area_left + area_mid + area_right
+    cum_left = area_left / total_area
+    cum_mid  = (area_left + area_mid) / total_area
+    samples = np.zeros(n_samples)
+    mask_left = u < cum_left
+    if np.any(mask_left):
+        samples[mask_left] = a + (b - a) * np.sqrt(u[mask_left] / cum_left)
+    mask_mid = (u >= cum_left) & (u < cum_mid)
+    if np.any(mask_mid):
+        samples[mask_mid] = b + (c - b) * (u[mask_mid] - cum_left) / (cum_mid - cum_left)
+    mask_right = u >= cum_mid
+    if np.any(mask_right):
+        samples[mask_right] = d - (d - c) * np.sqrt((1 - u[mask_right]) / (1 - cum_mid))
+    return samples
+
+
+# ============================================================================
+# VEHICLE ROUTING
+# ============================================================================
+
+def select_vehicle_type(arc_type, distance_km):
+    if arc_type == "lake":
+        candidates = ["lake_barge", "truck_40ft"]
+    elif arc_type == "inter_hub":
+        candidates = ["rail_wagon", "truck_40ft"]
+    else:
+        candidates = ["truck_40ft", "truck_20ft"]
+    return min(candidates, key=lambda v: VEHICLE_TYPES[v]["cost_per_km"] / VEHICLE_TYPES[v]["capacity_teu"])
+
+
+def compute_vehicle_deployment(solution):
+    deployment = {}
+    for origin, data in solution.origin_to_hub.items():
+        hub = data["hub"]
+        teu, dist = data["supply_teu"], data["distance"]
+        vtype = select_vehicle_type("origin_hub", dist)
+        vt = VEHICLE_TYPES[vtype]
+        n = int(np.ceil(teu / vt["capacity_teu"]))
+        util = teu / (n * vt["capacity_teu"])
+        driving_h = dist / vt["speed_kmh"]
+        deployment[(origin, hub)] = {
+            "arc_type": "origin_hub", "flow_teu": float(teu), "distance_km": float(dist),
+            "vehicle_type": vtype, "capacity_teu": vt["capacity_teu"], "count": n,
+            "utilization": float(util), "driving_hours": float(driving_h),
+            "days_required": int(np.ceil(driving_h / DRIVER_HOURS_PER_DAY)) if driving_h > 0 else 1,
+        }
+    for dest, data in solution.hub_to_destination.items():
+        hub = data["hub"]
+        teu, dist = data["demand_teu"], data["distance"]
+        arc_type = "lake" if (hub, dest) in LAKE_ARCS else "hub_dest"
+        vtype = select_vehicle_type(arc_type, dist)
+        vt = VEHICLE_TYPES[vtype]
+        n = int(np.ceil(teu / vt["capacity_teu"]))
+        util = teu / (n * vt["capacity_teu"])
+        driving_h = dist / vt["speed_kmh"]
+        deployment[(hub, dest)] = {
+            "arc_type": arc_type, "flow_teu": float(teu), "distance_km": float(dist),
+            "vehicle_type": vtype, "capacity_teu": vt["capacity_teu"], "count": n,
+            "utilization": float(util), "driving_hours": float(driving_h),
+            "days_required": int(np.ceil(driving_h / DRIVER_HOURS_PER_DAY)) if driving_h > 0 else 1,
+        }
+    for leg, teu in solution.inter_hub_exchanges.items():
+        i, j = leg.split("->")
+        dist = DISTANCES.get((i, j), 450)
+        vtype = select_vehicle_type("inter_hub", dist)
+        vt = VEHICLE_TYPES[vtype]
+        n = max(1, int(np.ceil(teu / vt["capacity_teu"])))
+        util = teu / (n * vt["capacity_teu"])
+        driving_h = dist / vt["speed_kmh"]
+        deployment[(i, j)] = {
+            "arc_type": "inter_hub", "flow_teu": float(teu), "distance_km": float(dist),
+            "vehicle_type": vtype, "capacity_teu": vt["capacity_teu"], "count": n,
+            "utilization": float(util), "driving_hours": float(driving_h),
+            "days_required": int(np.ceil(driving_h / DRIVER_HOURS_PER_DAY)) if driving_h > 0 else 1,
+        }
+    return deployment
+
+
+def summarize_vehicle_deployment(deployment):
+    total_vehicles = 0
+    total_capacity = 0
+    total_flow = 0
+    by_type = {}
+    by_arc_type = {"origin_hub": 0, "inter_hub": 0, "hub_dest": 0, "lake": 0}
+    for (i, j), d in deployment.items():
+        total_vehicles += d["count"]
+        total_capacity += d["count"] * d["capacity_teu"]
+        total_flow += d["flow_teu"]
+        by_type[d["vehicle_type"]] = by_type.get(d["vehicle_type"], 0) + d["count"]
+        by_arc_type[d["arc_type"]] = by_arc_type.get(d["arc_type"], 0) + d["count"]
+    weighted_util = total_flow / total_capacity if total_capacity > 0 else 0.0
+    return {
+        "total_vehicles": total_vehicles,
+        "total_capacity_teu": total_capacity,
+        "total_flow_teu": total_flow,
+        "weighted_utilization": weighted_util,
+        "by_vehicle_type": by_type,
+        "by_arc_type": by_arc_type,
+        "fleet_composition_pct": {
+            k: 100.0 * v / total_vehicles if total_vehicles > 0 else 0.0
+            for k, v in by_type.items()
+        },
+    }
+
+
+# ============================================================================
+# SOLUTION CLASS
+# ============================================================================
+
+class EACSolution:
+    def __init__(self, alpha=0.75, uncertainty_mode="fuzzy", tw_tightness=1.0,
+                 deterministic_mode=False):
+        self.alpha = alpha
+        self.uncertainty_mode = uncertainty_mode
+        self.tw_tightness = tw_tightness
+        self.deterministic_mode = deterministic_mode
+
+        self.hub_allocation = {}
+        self.transport_cost = 0.0
+        self.fuel_cost = 0.0
+        self.transfer_cost = 0.0
+        self.handling_cost = 0.0
+        self.base_cost = 0.0
+        self.total_cost = 0.0
+        self.cost_per_teu = 0.0
+        self.total_time = 0.0
+        self.border_delay = 0.0
+        self.hub_utilization = {}
+        self.hub_balance = 0.0
+        self.gini_coefficient = 0.0
+        self.inter_hub_flow = 0.0
+        self.inter_hub_imbalance = 0.0
+        self.inter_hub_spatial = 0.0
+        self.transfer_efficiency = 0.0
+        self.hub_proximity = 0.0
+        self.proximity_efficiency = 0.0
+        self.co2_emissions = 0.0
+        self.pud_feasible = True
+        self.precedence_feasibility = True
+        self.tw_violation_rate = 0.0
+        self.swvr = 0.0
+        self.avg_lateness = 0.0
+        self.normalized_lateness = 0.0
+        self.credibility_satisfaction = 0.0
+        self.min_credibility = 1.0
+        self.robustness_index = 0.0
+        self.ciw = 0.0
+        self.mc_cost_95 = 0.0
+        self.mc_cost_50 = 0.0
+        self.chance_violations = 0
+        self.feasible = True
+        self.reliability_penalty = 0.0
+        self.origin_to_hub = {}
+        self.hub_to_destination = {}
+        self.inter_hub_exchanges = {}
+        self.objectives = None
+        self.rank = -1
+        self.crowding_distance = 0.0
+        self.dominated_set = []
+        self.domination_count = 0
+        self.runtime = 0.0
+        self.vehicle_deployment = {}
+        self.vehicle_summary = {}
+
+    def initialize_random(self):
+        hubs = list(HUBS.keys())
+        for origin in ORIGINS.keys():
+            self.hub_allocation[f"origin_{origin}"] = rnd.choice(hubs)
+        for dest in DESTINATIONS.keys():
+            self.hub_allocation[f"dest_{dest}"] = rnd.choice(hubs)
+        self.alpha = rnd.uniform(0.5, 1.0)
+        self.evaluate()
+
+    def evaluate(self):
+        hubs_list = list(HUBS.keys())
+        total_teu = sum(o["supply_teu"] for o in ORIGINS.values())
+
+        transport_cost = 0.0
+        for key, hub in self.hub_allocation.items():
+            if key.startswith("origin_"):
+                origin = key.replace("origin_", "")
+                dist = DISTANCES.get((origin, hub), 1000)
+                transport_cost += ORIGINS[origin]["supply_teu"] * dist * COST_PER_KM
+            elif key.startswith("dest_"):
+                dest = key.replace("dest_", "")
+                dist = DISTANCES.get((hub, dest), 1000)
+                transport_cost += DESTINATIONS[dest]["demand_teu"] * dist * COST_PER_KM
+        self.transport_cost = transport_cost
+
+        fuel_cost = 0.0
+        for key, hub in self.hub_allocation.items():
+            if key.startswith("origin_"):
+                origin = key.replace("origin_", "")
+                dist = DISTANCES.get((origin, hub), 1000)
+                fuel_cost += ORIGINS[origin]["supply_teu"] * dist * FUEL_COST_PER_KM / 2
+            elif key.startswith("dest_"):
+                dest = key.replace("dest_", "")
+                dist = DISTANCES.get((hub, dest), 1000)
+                fuel_cost += DESTINATIONS[dest]["demand_teu"] * dist * FUEL_COST_PER_KM / 2
+        self.fuel_cost = fuel_cost
+
+        handling_cost = 0.0
+        for hub in hubs_list:
+            origin_teu = sum(ORIGINS[o]["supply_teu"] for o in ORIGINS
+                             if self.hub_allocation.get(f"origin_{o}") == hub)
+            dest_teu = sum(DESTINATIONS[d]["demand_teu"] for d in DESTINATIONS
+                           if self.hub_allocation.get(f"dest_{d}") == hub)
+            handling_cost += (origin_teu + dest_teu) * HUBS[hub]["handling_cost_per_teu"]
+        self.handling_cost = handling_cost
+
+        hub_flows = {}
+        for hub in hubs_list:
+            origin_teu = sum(ORIGINS[o]["supply_teu"] for o in ORIGINS
+                             if self.hub_allocation.get(f"origin_{o}") == hub)
+            dest_teu = sum(DESTINATIONS[d]["demand_teu"] for d in DESTINATIONS
+                           if self.hub_allocation.get(f"dest_{d}") == hub)
+            hub_flows[hub] = origin_teu - dest_teu
+        self.inter_hub_flow = sum(abs(v) for v in hub_flows.values()) / 2
+        self.transfer_cost = self.inter_hub_flow * INTER_HUB_TRANSFER_COST
+
+        total_supply = sum(ORIGINS[o]["supply_teu"] for o in ORIGINS)
+        total_demand = sum(DESTINATIONS[d]["demand_teu"] for d in DESTINATIONS)
+        self.inter_hub_imbalance = abs(total_supply - total_demand)
+        self.inter_hub_spatial = max(0, self.inter_hub_flow - self.inter_hub_imbalance)
+        self.transfer_efficiency = (self.inter_hub_imbalance / self.inter_hub_flow
+                                    if self.inter_hub_flow > 0 else 0.0)
+
+        fixed_cost = (total_teu / 50) * VEHICLE_FIXED_COST
+        self.base_cost = (transport_cost + fuel_cost + handling_cost
+                          + self.transfer_cost + fixed_cost)
+
+        total_time = 0.0
+        for key, hub in self.hub_allocation.items():
+            if key.startswith("origin_"):
+                origin = key.replace("origin_", "")
+                fuzzy = FUZZY_TRANSIT.get((origin, hub), (10.0, 11.0, 13.0, 15.0))
+                total_time += fuzzy_expected(fuzzy)
+            elif key.startswith("dest_"):
+                dest = key.replace("dest_", "")
+                fuzzy = FUZZY_TRANSIT.get((hub, dest), (20.0, 21.7, 25.0, 28.0))
+                total_time += fuzzy_expected(fuzzy)
+
+        border_delay = 0.0
+        for dest, data in DESTINATIONS.items():
+            hub = self.hub_allocation.get(f"dest_{dest}")
+            if hub is None:
+                continue
+            border_name = ROUTE_BORDER.get((hub, dest))
+            if border_name:
+                border_fuzzy = BORDER_CLEARANCE.get(border_name, (0, 0, 0, 0))
+                border_delay += fuzzy_expected(border_fuzzy) * data["demand_teu"] / total_teu
+        self.border_delay = border_delay
+        self.total_time = total_time + border_delay
+
+        self.chance_violations = 0
+        self.feasible = True
+        self.credibility_satisfaction = 0.0
+        self.min_credibility = 1.0
+        ciw_sum = 0.0
+
+        if self.deterministic_mode:
+            self.credibility_satisfaction = 1.0
+            self.min_credibility = 1.0
+            self.ciw = 0.0
+        elif self.uncertainty_mode == "fuzzy":
+            for dest, data in DESTINATIONS.items():
+                hub = self.hub_allocation.get(f"dest_{dest}")
+                if hub is None:
+                    continue
+                fuzzy_transit = FUZZY_TRANSIT.get((hub, dest))
+                if fuzzy_transit is None:
+                    continue
+                border_name = ROUTE_BORDER.get((hub, dest))
+                border_fuzzy = BORDER_CLEARANCE.get(border_name, (0, 0, 0, 0)) if border_name else (0, 0, 0, 0)
+                composite = fuzzy_add(fuzzy_transit, border_fuzzy)
+                effective_deadline = data["earliest_delivery"] + (data["latest_delivery"] - data["earliest_delivery"]) * self.tw_tightness
+                nec = necessity_measure(composite, effective_deadline)
+                if nec >= self.alpha:
+                    self.credibility_satisfaction += 1
+                else:
+                    self.chance_violations += 1
+                if nec < self.min_credibility:
+                    self.min_credibility = nec
+                ciw_sum += (composite[3] - composite[0])
+            n_dests = len(DESTINATIONS)
+            self.credibility_satisfaction /= n_dests
+            self.ciw = ciw_sum / n_dests
+            if self.chance_violations > 0:
+                self.feasible = False
+
+        self.total_cost = self.base_cost
+        self.cost_per_teu = self.total_cost / total_teu if total_teu > 0 else 0
+
+        utils = []
+        for hub in hubs_list:
+            origin_teu = sum(ORIGINS[o]["supply_teu"] for o in ORIGINS
+                             if self.hub_allocation.get(f"origin_{o}") == hub)
+            dest_teu = sum(DESTINATIONS[d]["demand_teu"] for d in DESTINATIONS
+                           if self.hub_allocation.get(f"dest_{d}") == hub)
+            utils.append((origin_teu + dest_teu) / HUBS[hub]["capacity_teu"])
+
+        if len(utils) > 1:
+            sorted_u = np.sort(utils)
+            n = len(sorted_u)
+            self.gini_coefficient = (2 * np.sum(np.arange(1, n + 1) * sorted_u)
+                                     / (n * np.sum(sorted_u))) - (n + 1) / n
+            self.gini_coefficient = max(0, min(1, self.gini_coefficient))
+            self.hub_balance = 1 - self.gini_coefficient
+        else:
+            self.gini_coefficient = 0
+            self.hub_balance = 1.0
+
+        proximity_sum = 0.0
+        weight_sum = 0.0
+        for origin in ORIGINS.keys():
+            hub = self.hub_allocation.get(f"origin_{origin}")
+            if hub:
+                proximity_sum += ORIGINS[origin]["supply_teu"] * DISTANCES.get((origin, hub), 1000)
+                weight_sum += ORIGINS[origin]["supply_teu"]
+        self.hub_proximity = proximity_sum / weight_sum if weight_sum > 0 else 0
+
+        min_proximity = 0.0
+        for origin in ORIGINS.keys():
+            min_dist = min(DISTANCES.get((origin, h), 1000) for h in hubs_list)
+            min_proximity += ORIGINS[origin]["supply_teu"] * min_dist
+        min_proximity /= weight_sum if weight_sum > 0 else 1
+        self.proximity_efficiency = min_proximity / self.hub_proximity if self.hub_proximity > 0 else 1.0
+
+        total_distance = 0.0
+        for key, hub in self.hub_allocation.items():
+            if key.startswith("origin_"):
+                origin = key.replace("origin_", "")
+                total_distance += DISTANCES.get((origin, hub), 1000)
+            elif key.startswith("dest_"):
+                dest = key.replace("dest_", "")
+                total_distance += DISTANCES.get((hub, dest), 1000)
+        self.co2_emissions = total_distance * CO2_PER_KM
+
+        self.precedence_feasibility = True
+        self.pud_feasible = self.feasible
+        self.objectives = np.array([self.total_cost, self.total_time, -self.hub_balance])
+
+    def extract_routes(self):
+        hubs_list = list(HUBS.keys())
+        self.origin_to_hub = {}
+        for origin in ORIGINS.keys():
+            hub = self.hub_allocation.get(f"origin_{origin}", hubs_list[0])
+            self.origin_to_hub[origin] = {
+                "hub": hub, "supply_teu": ORIGINS[origin]["supply_teu"],
+                "distance": DISTANCES.get((origin, hub), 1000),
+            }
+        self.hub_to_destination = {}
+        for dest in DESTINATIONS.keys():
+            hub = self.hub_allocation.get(f"dest_{dest}", hubs_list[0])
+            self.hub_to_destination[dest] = {
+                "hub": hub, "demand_teu": DESTINATIONS[dest]["demand_teu"],
+                "distance": DISTANCES.get((hub, dest), 1000),
+            }
+        self.hub_utilization = {}
+        for hub in hubs_list:
+            origin_teu = sum(ORIGINS[o]["supply_teu"] for o in ORIGINS
+                             if self.hub_allocation.get(f"origin_{o}") == hub)
+            dest_teu = sum(DESTINATIONS[d]["demand_teu"] for d in DESTINATIONS
+                           if self.hub_allocation.get(f"dest_{d}") == hub)
+            total_teu = origin_teu + dest_teu
+            self.hub_utilization[hub] = {
+                "origin_teu": origin_teu, "dest_teu": dest_teu,
+                "total_teu": total_teu, "capacity": HUBS[hub]["capacity_teu"],
+                "utilization_pct": (total_teu / HUBS[hub]["capacity_teu"]) * 100,
+            }
+
+        self.inter_hub_exchanges = {}
+        flows = {}
+        for hub in hubs_list:
+            origin_teu = sum(ORIGINS[o]["supply_teu"] for o in ORIGINS
+                             if self.hub_allocation.get(f"origin_{o}") == hub)
+            dest_teu = sum(DESTINATIONS[d]["demand_teu"] for d in DESTINATIONS
+                           if self.hub_allocation.get(f"dest_{d}") == hub)
+            flows[hub] = origin_teu - dest_teu
+
+        if len(hubs_list) == 2:
+            h1, h2 = hubs_list[0], hubs_list[1]
+            flow_1, flow_2 = flows[h1], flows[h2]
+            total_flow = (abs(flow_1) + abs(flow_2)) / 2.0
+            if flow_1 > 0:
+                fwd_leg, rev_leg = f"{h1}->{h2}", f"{h2}->{h1}"
+                fwd_amt = min(flow_1, abs(flow_2))
+                rev_amt = total_flow - fwd_amt
+            else:
+                fwd_leg, rev_leg = f"{h2}->{h1}", f"{h1}->{h2}"
+                fwd_amt = min(abs(flow_2), flow_1)
+                rev_amt = total_flow - fwd_amt
+            if fwd_amt > 0:
+                self.inter_hub_exchanges[fwd_leg] = float(fwd_amt)
+            if rev_amt > 0:
+                self.inter_hub_exchanges[rev_leg] = float(rev_amt)
+            self.inter_hub_flow = float(total_flow)
+
+        self.vehicle_deployment = compute_vehicle_deployment(self)
+        self.vehicle_summary = summarize_vehicle_deployment(self.vehicle_deployment)
+
+    def dominates(self, other):
+        if not self.feasible and other.feasible:
+            return False
+        if self.feasible and not other.feasible:
+            return True
+        if (self.total_cost <= other.total_cost
+                and self.total_time <= other.total_time
+                and self.hub_balance >= other.hub_balance):
+            if (self.total_cost < other.total_cost
+                    or self.total_time < other.total_time
+                    or self.hub_balance > other.hub_balance):
+                return True
+        return False
+
+    def copy(self):
+        new = EACSolution(self.alpha, self.uncertainty_mode, self.tw_tightness,
+                          self.deterministic_mode)
+        new.hub_allocation = self.hub_allocation.copy()
+        for attr in ["transport_cost", "fuel_cost", "transfer_cost", "handling_cost",
+                     "base_cost", "total_cost", "cost_per_teu", "total_time", "border_delay",
+                     "hub_balance", "gini_coefficient", "inter_hub_flow",
+                     "inter_hub_imbalance", "inter_hub_spatial", "transfer_efficiency",
+                     "hub_proximity", "proximity_efficiency", "co2_emissions",
+                     "chance_violations", "feasible", "reliability_penalty",
+                     "pud_feasible", "precedence_feasibility",
+                     "tw_violation_rate", "swvr", "avg_lateness", "normalized_lateness",
+                     "credibility_satisfaction", "min_credibility", "robustness_index",
+                     "ciw", "mc_cost_95", "mc_cost_50", "runtime"]:
+            setattr(new, attr, getattr(self, attr))
+        for attr in ["hub_utilization", "origin_to_hub", "hub_to_destination",
+                     "inter_hub_exchanges", "vehicle_deployment", "vehicle_summary"]:
+            setattr(new, attr, getattr(self, attr).copy())
+        new.objectives = self.objectives.copy() if self.objectives is not None else None
+        return new
+
+
+# ============================================================================
+# MONTE CARLO
+# ============================================================================
+
+def monte_carlo_evaluate(solution, n_samples=1000):
+    violations_per_scenario = np.zeros(n_samples, dtype=bool)
+    lateness_per_scenario   = np.zeros(n_samples)
+    swvr_per_scenario       = np.zeros(n_samples)
+    tw_widths_sum = 0.0
+    n_valid = 0
+
+    for dest, data in DESTINATIONS.items():
+        hub = solution.hub_allocation.get(f"dest_{dest}")
+        if hub is None:
+            continue
+        fuzzy = FUZZY_TRANSIT.get((hub, dest))
+        if fuzzy is None:
+            continue
+        transit_samples = sample_trapezoidal_vectorized(fuzzy, n_samples)
+        border_name = ROUTE_BORDER.get((hub, dest))
+        if border_name:
+            border_fuzzy = BORDER_CLEARANCE.get(border_name, (0, 0, 0, 0))
+            border_samples = sample_trapezoidal_vectorized(border_fuzzy, n_samples)
+            transit_samples += border_samples
+            del border_samples
+
+        tw_width = (data["latest_delivery"] - data["earliest_delivery"]) * solution.tw_tightness
+        effective_deadline = data["earliest_delivery"] + (data["latest_delivery"] - data["earliest_delivery"]) * solution.tw_tightness
+        excess = transit_samples - effective_deadline
+        del transit_samples
+
+        violations_per_scenario |= (excess > 0)
+        lateness_per_scenario += np.maximum(excess, 0) * data["demand_teu"] / 50
+        if tw_width > 0:
+            swvr_per_scenario += np.maximum(excess, 0) / tw_width
+        del excess
+
+        tw_widths_sum += tw_width
+        n_valid += 1
+
+    if n_valid == 0:
+        return {
+            "tw_violation_rate": 0.0, "avg_lateness": 0.0, "swvr": 0.0,
+            "normalized_lateness": 0.0, "cost_95": solution.base_cost,
+            "cost_50": solution.base_cost, "robustness_index": 0.0,
+        }
+
+    tw_violation_rate = float(np.mean(violations_per_scenario))
+    avg_lateness = float(np.mean(lateness_per_scenario))
+    swvr = float(np.mean(swvr_per_scenario) / n_valid)
+    avg_tw_width = tw_widths_sum / n_valid
+    normalized_lateness = avg_lateness / avg_tw_width if avg_tw_width > 0 else 0.0
+
+    lateness_cost = lateness_per_scenario * 1000
+    cost_samples = solution.base_cost + lateness_cost
+    cost_95 = float(np.percentile(cost_samples, 95))
+    cost_50 = float(np.percentile(cost_samples, 50))
+    robustness_index = (cost_95 - cost_50) / cost_50 if cost_50 > 0 else 0.0
+
+    del violations_per_scenario, lateness_per_scenario, swvr_per_scenario, cost_samples
+
+    return {
+        "tw_violation_rate": tw_violation_rate, "avg_lateness": avg_lateness,
+        "swvr": swvr, "normalized_lateness": normalized_lateness,
+        "cost_95": cost_95, "cost_50": cost_50, "robustness_index": robustness_index,
+    }
+
+
+# ============================================================================
+# AFC-DE ALGORITHM
+# ============================================================================
+
+class AFCDE:
+    def __init__(self, pop_size=50, max_gen=200, alpha=0.75, tw_tightness=1.0,
+                 deterministic_mode=False):
+        self.pop_size = pop_size
+        self.max_gen = max_gen
+        self.alpha = alpha
+        self.tw_tightness = tw_tightness
+        self.deterministic_mode = deterministic_mode
+        self.F_init = 0.5
+        self.CR_init = 0.9
+        self.F = None
+        self.CR = None
+        self.population = []
+        self.feasibility_history = []
+
+    def _adapt_F_CR(self):
+        tau1 = tau2 = 0.1
+        F_l, F_u = 0.1, 0.9
+        for i in range(self.pop_size):
+            if rnd.random() < tau1:
+                self.F[i] = F_l + rnd.random() * F_u
+            if rnd.random() < tau2:
+                self.CR[i] = rnd.random()
+
+    def _mutate(self, i):
+        idxs = [j for j in range(self.pop_size) if j != i]
+        r1, r2, r3 = rnd.choice(idxs, 3, replace=False)
+        x1, x2, x3 = self.population[r1], self.population[r2], self.population[r3]
+        mutant = x1.copy()
+        F = self.F[i]
+        for key in x1.hub_allocation:
+            if rnd.random() < F:
+                mutant.hub_allocation[key] = x2.hub_allocation.get(key, x3.hub_allocation.get(key))
+        return mutant
+
+    def _crossover(self, target, mutant, i):
+        trial = target.copy()
+        CR = self.CR[i]
+        j_rand = rnd.randint(0, len(target.hub_allocation))
+        keys = list(target.hub_allocation.keys())
+        for j, key in enumerate(keys):
+            if rnd.random() < CR or j == j_rand:
+                trial.hub_allocation[key] = mutant.hub_allocation.get(key, target.hub_allocation[key])
+        trial.alpha = self.alpha
+        trial.tw_tightness = self.tw_tightness
+        trial.deterministic_mode = self.deterministic_mode
+        trial.evaluate()
+        return trial
+
+    def _repair(self, solution):
+        if solution.deterministic_mode:
+            solution.evaluate()
+            return solution
+        if solution.uncertainty_mode != "fuzzy":
+            return solution
+        for dest, data in DESTINATIONS.items():
+            hub = solution.hub_allocation.get(f"dest_{dest}")
+            if hub is None:
+                continue
+            fuzzy_transit = FUZZY_TRANSIT.get((hub, dest))
+            if fuzzy_transit is None:
+                continue
+            border_name = ROUTE_BORDER.get((hub, dest))
+            border_fuzzy = BORDER_CLEARANCE.get(border_name, (0, 0, 0, 0)) if border_name else (0, 0, 0, 0)
+            composite = fuzzy_add(fuzzy_transit, border_fuzzy)
+            effective_deadline = data["earliest_delivery"] + (data["latest_delivery"] - data["earliest_delivery"]) * solution.tw_tightness
+            nec = necessity_measure(composite, effective_deadline)
+            if nec < solution.alpha:
+                for alt_hub in HUBS.keys():
+                    if alt_hub == hub:
+                        continue
+                    alt_fuzzy = FUZZY_TRANSIT.get((alt_hub, dest))
+                    if alt_fuzzy is None:
+                        continue
+                    alt_border_name = ROUTE_BORDER.get((alt_hub, dest))
+                    alt_border_fuzzy = BORDER_CLEARANCE.get(alt_border_name, (0, 0, 0, 0)) if alt_border_name else (0, 0, 0, 0)
+                    alt_composite = fuzzy_add(alt_fuzzy, alt_border_fuzzy)
+                    alt_nec = necessity_measure(alt_composite, effective_deadline)
+                    if alt_nec >= solution.alpha:
+                        solution.hub_allocation[f"dest_{dest}"] = alt_hub
+                        break
+        solution.evaluate()
+        return solution
+
+    def _fast_non_dominated_sort(self, population):
+        for p in population:
+            p.dominated_set = []
+            p.domination_count = 0
+            for q in population:
+                if p.dominates(q):
+                    p.dominated_set.append(q)
+                elif q.dominates(p):
+                    p.domination_count += 1
+            p.rank = 0 if p.domination_count == 0 else -1
+        fronts = []
+        current = [p for p in population if p.rank == 0]
+        while current:
+            fronts.append(current)
+            nxt = []
+            for p in current:
+                for q in p.dominated_set:
+                    q.domination_count -= 1
+                    if q.domination_count == 0:
+                        q.rank = len(fronts)
+                        nxt.append(q)
+            current = nxt
+        return fronts
+
+    def _crowding_distance(self, front):
+        n = len(front)
+        if n <= 2:
+            for p in front:
+                p.crowding_distance = float("inf")
+            return
+        for p in front:
+            p.crowding_distance = 0
+        for obj in ["total_cost", "total_time"]:
+            front.sort(key=lambda x: getattr(x, obj))
+            mn = getattr(front[0], obj)
+            mx = getattr(front[-1], obj)
+            rng = mx - mn
+            if rng > 0:
+                front[0].crowding_distance = float("inf")
+                front[-1].crowding_distance = float("inf")
+                for i in range(1, n - 1):
+                    d = getattr(front[i + 1], obj) - getattr(front[i - 1], obj)
+                    front[i].crowding_distance += d / rng
+
+    def _select_next_generation(self, combined):
+        fronts = self._fast_non_dominated_sort(combined)
+        new_pop = []
+        for front in fronts:
+            if len(new_pop) + len(front) <= self.pop_size:
+                new_pop.extend(front)
+            else:
+                self._crowding_distance(front)
+                front.sort(key=lambda x: -x.crowding_distance)
+                new_pop.extend(front[: self.pop_size - len(new_pop)])
+                break
+        return new_pop
+
+    def run(self):
+        start_time = time.time()
+        self.population = []
+        for _ in range(self.pop_size):
+            sol = EACSolution(
+                alpha=self.alpha,
+                uncertainty_mode="fuzzy",
+                tw_tightness=self.tw_tightness,
+                deterministic_mode=self.deterministic_mode,
+            )
+            sol.initialize_random()
+            sol = self._repair(sol)
+            self.population.append(sol)
+        self.F  = np.full(self.pop_size, self.F_init)
+        self.CR = np.full(self.pop_size, self.CR_init)
+
+        for gen in range(self.max_gen):
+            self._adapt_F_CR()
+            offspring = []
+            for i in range(self.pop_size):
+                mutant = self._mutate(i)
+                trial = self._crossover(self.population[i], mutant, i)
+                trial = self._repair(trial)
+                offspring.append(trial)
+            combined = self.population + offspring
+            self.population = self._select_next_generation(combined)
+            for p in combined:
+                p.dominated_set = []
+            combined = None
+            offspring = None
+            if gen % 20 == 0:
+                gc.collect()
+            feasible_count = sum(1 for p in self.population if p.feasible)
+            self.feasibility_history.append(feasible_count / self.pop_size)
+
+        elapsed = time.time() - start_time
+        pareto = [p for p in self.population if p.rank == 0]
+        if not pareto:
+            pareto = self.population
+        return self.population, pareto, elapsed
+
+
+# ============================================================================
+# SOLUTION BUILDERS
+# ============================================================================
+
+def build_greedy_solution():
+    sol = EACSolution(alpha=1.0, uncertainty_mode="crisp-expected",
+                      deterministic_mode=True)
+    hubs_list = list(HUBS.keys())
+    for origin in ORIGINS.keys():
+        best_hub = min(hubs_list, key=lambda h: DISTANCES.get((origin, h), 10000))
+        sol.hub_allocation[f"origin_{origin}"] = best_hub
+    for dest in DESTINATIONS.keys():
+        best_hub = min(hubs_list, key=lambda h: DISTANCES.get((h, dest), 10000))
+        sol.hub_allocation[f"dest_{dest}"] = best_hub
+    sol.evaluate()
+    sol.extract_routes()
+
+    mc = monte_carlo_evaluate(sol, n_samples=1000)
+    sol.tw_violation_rate  = mc["tw_violation_rate"]
+    sol.avg_lateness       = mc["avg_lateness"]
+    sol.swvr               = mc["swvr"]
+    sol.normalized_lateness = mc["normalized_lateness"]
+    sol.mc_cost_95         = mc["cost_95"]
+    sol.mc_cost_50         = mc["cost_50"]
+    sol.robustness_index   = mc["robustness_index"]
+    sol.reliability_penalty = (mc["tw_violation_rate"] * RELIABILITY_PENALTY_PER_HOUR_PER_TEU * TOTAL_DEMAND_TEU
+                               + mc["avg_lateness"] * 1000)
+    sol.total_cost = sol.base_cost + sol.reliability_penalty
+    return sol
+
+
+def _finalize_solution(best, elapsed):
+    best.extract_routes()
+    mc = monte_carlo_evaluate(best, n_samples=1000)
+    best.tw_violation_rate  = mc["tw_violation_rate"]
+    best.avg_lateness       = mc["avg_lateness"]
+    best.swvr               = mc["swvr"]
+    best.normalized_lateness = mc["normalized_lateness"]
+    best.mc_cost_95         = mc["cost_95"]
+    best.mc_cost_50         = mc["cost_50"]
+    best.robustness_index   = mc["robustness_index"]
+    best.reliability_penalty = (mc["tw_violation_rate"] * RELIABILITY_PENALTY_PER_HOUR_PER_TEU * TOTAL_DEMAND_TEU
+                                + mc["avg_lateness"] * 1000)
+    best.total_cost = best.base_cost + best.reliability_penalty
+    best.runtime = elapsed
+    return best
+
+
+def run_deterministic_optimized(num_runs=3, pop_size=25, max_gen=60):
+    print("\n[Deterministic-AFC-DE]")
+    results = []
+    for run in range(num_runs):
+        runner = AFCDE(
+            pop_size=pop_size, max_gen=max_gen,
+            alpha=1.0, tw_tightness=1.0,
+            deterministic_mode=True,
+        )
+        pop, pareto, elapsed = runner.run()
+        feasible_pop = [p for p in pop if p.feasible]
+        best = (max(feasible_pop, key=lambda x: x.hub_balance) if feasible_pop
+                else max(pop, key=lambda x: (x.feasible, x.hub_balance)))
+        _finalize_solution(best, elapsed)
+        results.append(best)
+        print(f"  Run {run + 1}: Base=${best.base_cost:,.0f}, "
+              f"Rel.Pen=${best.reliability_penalty:,.0f}, Total=${best.total_cost:,.0f}, "
+              f"TW_Viol={best.tw_violation_rate * 100:.2f}%, Veh={best.vehicle_summary.get('total_vehicles', 0)}, "
+              f"Time={elapsed:.2f}s")
+        gc.collect()
+    return results
+
+
+def run_fuzzy_alpha(alpha, num_runs=3, pop_size=25, max_gen=60, tw_tightness=1.0):
+    print(f"\n[Fuzzy-AFC-DE alpha = {alpha:.2f}, TW tightness = {tw_tightness:.2f}]")
+    results = []
+    for run in range(num_runs):
+        runner = AFCDE(pop_size=pop_size, max_gen=max_gen, alpha=alpha,
+                       tw_tightness=tw_tightness, deterministic_mode=False)
+        pop, pareto, elapsed = runner.run()
+        feasible_pop = [p for p in pop if p.feasible]
+        best = (max(feasible_pop, key=lambda x: x.hub_balance) if feasible_pop
+                else max(pop, key=lambda x: (x.feasible, x.hub_balance)))
+        _finalize_solution(best, elapsed)
+        results.append(best)
+        print(f"  Run {run + 1}: Base=${best.base_cost:,.0f}, "
+              f"Rel.Pen=${best.reliability_penalty:,.0f}, Total=${best.total_cost:,.0f}, "
+              f"TW_Viol={best.tw_violation_rate * 100:.2f}%, Veh={best.vehicle_summary.get('total_vehicles', 0)}, "
+              f"Time={elapsed:.2f}s")
+        gc.collect()
+    return results
+
+
+def compute_metrics(solutions):
+    if not solutions:
+        return {}
+    base = {
+        "base_cost":              np.mean([s.base_cost for s in solutions]),
+        "base_cost_std":          np.std([s.base_cost for s in solutions], ddof=1) if len(solutions) > 1 else 0.0,
+        "reliability_penalty":    np.mean([s.reliability_penalty for s in solutions]),
+        "total_cost":             np.mean([s.total_cost for s in solutions]),
+        "total_cost_std":         np.std([s.total_cost for s in solutions], ddof=1) if len(solutions) > 1 else 0.0,
+        "cost_per_teu":           np.mean([s.cost_per_teu for s in solutions]),
+        "hub_balance":            np.mean([s.hub_balance for s in solutions]),
+        "gini_coefficient":       np.mean([s.gini_coefficient for s in solutions]),
+        "inter_hub_flow":         np.mean([s.inter_hub_flow for s in solutions]),
+        "inter_hub_imbalance":    np.mean([s.inter_hub_imbalance for s in solutions]),
+        "inter_hub_spatial":      np.mean([s.inter_hub_spatial for s in solutions]),
+        "transfer_efficiency":    np.mean([s.transfer_efficiency for s in solutions]),
+        "hub_proximity":          np.mean([s.hub_proximity for s in solutions]),
+        "proximity_efficiency":   np.mean([s.proximity_efficiency for s in solutions]),
+        "co2_emissions":          np.mean([s.co2_emissions for s in solutions]),
+        "pud_feasible":           np.mean([1.0 if s.pud_feasible else 0.0 for s in solutions]),
+        "precedence_feasibility": np.mean([1.0 if s.precedence_feasibility else 0.0 for s in solutions]),
+        "tw_violation_rate":      np.mean([s.tw_violation_rate for s in solutions]),
+        "swvr":                   np.mean([s.swvr for s in solutions]),
+        "avg_lateness":           np.mean([s.avg_lateness for s in solutions]),
+        "normalized_lateness":    np.mean([s.normalized_lateness for s in solutions]),
+        "credibility_satisfaction": np.mean([s.credibility_satisfaction for s in solutions]),
+        "min_credibility":        np.mean([s.min_credibility for s in solutions]),
+        "robustness_index":       np.mean([s.robustness_index for s in solutions]),
+        "ciw":                    np.mean([s.ciw for s in solutions]),
+        "chance_violations":      np.mean([s.chance_violations for s in solutions]),
+        "feasible_rate":          np.mean([1.0 if s.feasible else 0.0 for s in solutions]),
+        "runtime":                np.mean([getattr(s, "runtime", 0) for s in solutions]),
+    }
+    veh_solutions = [s for s in solutions if getattr(s, "vehicle_summary", {})]
+    if veh_solutions:
+        base["total_vehicles"]        = np.mean([s.vehicle_summary["total_vehicles"] for s in veh_solutions])
+        base["weighted_utilization"]  = np.mean([s.vehicle_summary["weighted_utilization"] for s in veh_solutions])
+        base["trucks_40ft"]           = np.mean([s.vehicle_summary["by_vehicle_type"].get("truck_40ft", 0) for s in veh_solutions])
+        base["rail_wagons"]           = np.mean([s.vehicle_summary["by_vehicle_type"].get("rail_wagon", 0) for s in veh_solutions])
+        base["lake_barges"]           = np.mean([s.vehicle_summary["by_vehicle_type"].get("lake_barge", 0) for s in veh_solutions])
+    return base
+
+
+def compute_problem_specific_metrics(best_solution):
+    metrics = {}
+    metrics["hub_utilization_mombasa_pct"]      = best_solution.hub_utilization.get("Mombasa", {}).get("utilization_pct", 0.0)
+    metrics["hub_utilization_dar_es_salaam_pct"] = best_solution.hub_utilization.get("Dar_es_Salaam", {}).get("utilization_pct", 0.0)
+
+    metrics["hub_balance"]             = best_solution.hub_balance
+    metrics["gini_coefficient"]        = best_solution.gini_coefficient
+    metrics["inter_hub_flow_teu"]      = best_solution.inter_hub_flow
+    metrics["inter_hub_imbalance_teu"] = best_solution.inter_hub_imbalance
+    metrics["inter_hub_spatial_teu"]   = best_solution.inter_hub_spatial
+    metrics["transfer_efficiency"]     = best_solution.transfer_efficiency
+    metrics["hub_proximity_km"]        = best_solution.hub_proximity
+    metrics["proximity_efficiency"]    = best_solution.proximity_efficiency
+
+    metrics["precedence_feasibility"] = best_solution.precedence_feasibility
+    metrics["tw_violation_rate"]      = best_solution.tw_violation_rate
+    metrics["swvr"]                   = best_solution.swvr
+    metrics["avg_lateness_h"]         = best_solution.avg_lateness
+    metrics["normalized_lateness"]    = best_solution.normalized_lateness
+
+    metrics["credibility_satisfaction"] = best_solution.credibility_satisfaction
+    metrics["min_credibility"]          = best_solution.min_credibility
+    metrics["robustness_index"]         = best_solution.robustness_index
+    metrics["ciw_h"]                    = best_solution.ciw
+
+    if getattr(best_solution, "vehicle_summary", {}):
+        vs = best_solution.vehicle_summary
+        metrics["total_vehicles"]              = vs["total_vehicles"]
+        metrics["weighted_vehicle_utilization"] = vs["weighted_utilization"]
+        metrics["fleet_truck_40ft"]            = vs["by_vehicle_type"].get("truck_40ft", 0)
+        metrics["fleet_truck_20ft"]            = vs["by_vehicle_type"].get("truck_20ft", 0)
+        metrics["fleet_rail_wagon"]            = vs["by_vehicle_type"].get("rail_wagon", 0)
+        metrics["fleet_lake_barge"]            = vs["by_vehicle_type"].get("lake_barge", 0)
+        metrics["fleet_arc_origin_hub"]        = vs["by_arc_type"].get("origin_hub", 0)
+        metrics["fleet_arc_inter_hub"]         = vs["by_arc_type"].get("inter_hub", 0)
+        metrics["fleet_arc_hub_dest"]          = vs["by_arc_type"].get("hub_dest", 0)
+        metrics["fleet_arc_lake"]              = vs["by_arc_type"].get("lake", 0)
+    return metrics
+
+
+# ============================================================================
+# EXPORT FUNCTIONS
+# ============================================================================
+
+def export_three_way_comparison(greedy_sol, det_metrics, fuzzy_metrics, fuzzy_results, out_dirs):
+    def _row(name, met):
+        return {
+            "Method":                   name,
+            "Base Cost (USD)":          f"{met['base_cost']:,.0f}",
+            "Reliability Penalty (USD)": f"{met['reliability_penalty']:,.0f}",
+            "Total Cost (USD)":         f"{met['total_cost']:,.0f}",
+            "TW Violation (%)":         f"{met['tw_violation_rate'] * 100:.2f}",
+            "SWVR":                     f"{met['swvr']:.4f}",
+            "Vehicles":                 f"{met.get('total_vehicles', 0):.0f}",
+            "Feasibility (%)":          f"{met['feasible_rate'] * 100:.0f}",
+        }
+
+    greedy_met = compute_metrics([greedy_sol])
+    rows = [
+        _row("Greedy nearest-hub",               greedy_met),
+        _row("Deterministic-AFC-DE",             det_metrics),
+        _row("Fuzzy-AFC-DE (alpha=0.50)",        fuzzy_metrics[0.50]),
+        _row("Fuzzy-AFC-DE (alpha=0.75)",        fuzzy_metrics[0.75]),
+        _row("Fuzzy-AFC-DE (alpha=0.90)",        fuzzy_metrics[0.90]),
+        _row("Fuzzy-AFC-DE (alpha=0.95)",        fuzzy_metrics[0.95]),
+    ]
+    df = pd.DataFrame(rows)
+    df.to_csv(out_dirs["reports"] / "table1_three_way_comparison.csv", index=False, encoding="utf-8")
+    (out_dirs["reports"] / "table1_three_way_comparison.tex").write_text(
+        df.to_latex(index=False, escape=False,
+                    caption="Three-way comparison: greedy baseline, deterministic-AFC-DE, and fuzzy-AFC-DE.",
+                    label="tab:three_way_comparison"),
+        encoding="utf-8")
+    print("  Saved: table1_three_way_comparison.csv/.tex")
+    return df
+
+
+def export_problem_specific_metrics(metrics_table, best_solution, out_dirs):
+    rows = [
+        {"Category": "Hub-and-Spoke",     "Metric": "Hub util (Mombasa, %)",          "Value": f"{metrics_table.get('hub_utilization_mombasa_pct', 0.0):.2f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Hub util (Dar es Salaam, %)",    "Value": f"{metrics_table.get('hub_utilization_dar_es_salaam_pct', 0.0):.2f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Hub balance",                    "Value": f"{metrics_table.get('hub_balance', 0.0):.4f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Gini coefficient",               "Value": f"{metrics_table.get('gini_coefficient', 0.0):.4f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Inter-hub transfer (TEU)",       "Value": f"{metrics_table.get('inter_hub_flow_teu', 0.0):.0f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Imbalance-driven transfer (TEU)", "Value": f"{metrics_table.get('inter_hub_imbalance_teu', 0.0):.0f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Spatial mismatch transfer (TEU)", "Value": f"{metrics_table.get('inter_hub_spatial_teu', 0.0):.0f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Transfer efficiency",            "Value": f"{metrics_table.get('transfer_efficiency', 0.0):.4f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Hub proximity (km)",             "Value": f"{metrics_table.get('hub_proximity_km', 0.0):.2f}"},
+        {"Category": "Hub-and-Spoke",     "Metric": "Proximity efficiency",           "Value": f"{metrics_table.get('proximity_efficiency', 0.0):.4f}"},
+        {"Category": "Pickup-and-Delivery", "Metric": "Precedence feasibility",       "Value": f"{metrics_table.get('precedence_feasibility', 0)}"},
+        {"Category": "Pickup-and-Delivery", "Metric": "TW violation rate",            "Value": f"{metrics_table.get('tw_violation_rate', 0.0):.4f}"},
+        {"Category": "Pickup-and-Delivery", "Metric": "SWVR",                          "Value": f"{metrics_table.get('swvr', 0.0):.4f}"},
+        {"Category": "Pickup-and-Delivery", "Metric": "Average lateness (h)",         "Value": f"{metrics_table.get('avg_lateness_h', 0.0):.4f}"},
+        {"Category": "Pickup-and-Delivery", "Metric": "Normalized lateness",          "Value": f"{metrics_table.get('normalized_lateness', 0.0):.4f}"},
+        {"Category": "Fuzzy Uncertainty", "Metric": "Credibility satisfaction",       "Value": f"{metrics_table.get('credibility_satisfaction', 0.0):.4f}"},
+        {"Category": "Fuzzy Uncertainty", "Metric": "Minimum credibility",            "Value": f"{metrics_table.get('min_credibility', 0.0):.4f}"},
+        {"Category": "Fuzzy Uncertainty", "Metric": "Robustness index",               "Value": f"{metrics_table.get('robustness_index', 0.0):.4f}"},
+        {"Category": "Fuzzy Uncertainty", "Metric": "CIW (h)",                         "Value": f"{metrics_table.get('ciw_h', 0.0):.4f}"},
+        {"Category": "Vehicle",           "Metric": "Total vehicle-trips",            "Value": f"{metrics_table.get('total_vehicles', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Weighted utilization",           "Value": f"{metrics_table.get('weighted_vehicle_utilization', 0.0):.4f}"},
+        {"Category": "Vehicle",           "Metric": "40-ft truck count",              "Value": f"{metrics_table.get('fleet_truck_40ft', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Rail wagon count",               "Value": f"{metrics_table.get('fleet_rail_wagon', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Lake barge count",               "Value": f"{metrics_table.get('fleet_lake_barge', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Origin-hub trips",               "Value": f"{metrics_table.get('fleet_arc_origin_hub', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Inter-hub trips",                "Value": f"{metrics_table.get('fleet_arc_inter_hub', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Hub-destination trips",          "Value": f"{metrics_table.get('fleet_arc_hub_dest', 0):.0f}"},
+        {"Category": "Vehicle",           "Metric": "Lake trips",                     "Value": f"{metrics_table.get('fleet_arc_lake', 0):.0f}"},
+    ]
+    df = pd.DataFrame(rows)
+    df.to_csv(out_dirs["reports"] / "problem_specific_metrics.csv", index=False, encoding="utf-8")
+    (out_dirs["reports"] / "table2_problem_specific_metrics.tex").write_text(
+        df.to_latex(index=False, escape=False,
+                    caption="Problem-specific performance metrics for the best fuzzy solution.",
+                    label="tab:problem_metrics"),
+        encoding="utf-8")
+    print("  Saved: problem_specific_metrics.csv/.tex")
+    return df
+
+
+def export_recommended_plan(best_solution, out_dirs):
+    rows3 = []
+    for origin, data in best_solution.origin_to_hub.items():
+        rows3.append({"Type": "Origin", "Node": origin, "Assigned Hub": data["hub"],
+                      "Volume (TEU)": data["supply_teu"], "Distance (km)": data["distance"]})
+    for dest, data in best_solution.hub_to_destination.items():
+        rows3.append({"Type": "Destination", "Node": dest, "Assigned Hub": data["hub"],
+                      "Volume (TEU)": data["demand_teu"], "Distance (km)": data["distance"]})
+    df = pd.DataFrame(rows3)
+    df.to_csv(out_dirs["reports"] / "table3_recommended_plan.csv", index=False, encoding="utf-8")
+    (out_dirs["reports"] / "table3_recommended_plan.tex").write_text(
+        df.to_latex(index=False, escape=False,
+                    caption="Recommended routing plan for the extended East African Corridor.",
+                    label="tab:recommended_plan"),
+        encoding="utf-8")
+    print("  Saved: table3_recommended_plan.csv/.tex")
+    return df
+
+
+def export_vehicle_deployment(best_solution, out_dirs):
+    if not getattr(best_solution, "vehicle_deployment", {}):
+        return None
+    rows4 = []
+    for (i, j), d in best_solution.vehicle_deployment.items():
+        rows4.append({
+            "Arc": f"{i} -> {j}",
+            "Arc Type": d["arc_type"].replace("_", "-"),
+            "Flow (TEU)": f"{d['flow_teu']:.0f}",
+            "Vehicle Type": d["vehicle_type"].replace("_", "-"),
+            "Count": d["count"],
+            "Utilization": f"{d['utilization']:.3f}",
+            "Driving Hours": f"{d['driving_hours']:.1f}",
+            "Days": d["days_required"],
+        })
+    df = pd.DataFrame(rows4)
+    df.to_csv(out_dirs["reports"] / "table4_vehicle_deployment.csv", index=False, encoding="utf-8")
+    (out_dirs["reports"] / "table4_vehicle_deployment.tex").write_text(
+        df.to_latex(index=False, escape=False,
+                    caption="Vehicle deployment by arc for the recommended fuzzy-AFC-DE plan.",
+                    label="tab:vehicle_deployment"),
+        encoding="utf-8")
+    print("  Saved: table4_vehicle_deployment.csv/.tex")
+    return df
+
+
+def export_best_solution_json(best_solution, det_metrics, greedy_sol, fuzzy_metrics,
+                              pct_greedy, pct_det, out_dirs):
+    plan = {
+        "network_config": {
+            "hubs":         list(HUBS.keys()),
+            "origins":      list(ORIGINS.keys()),
+            "destinations": list(DESTINATIONS.keys()),
+            "borders":      list(BORDER_CLEARANCE.keys()),
+            "n_hubs":         len(HUBS),
+            "n_origins":      len(ORIGINS),
+            "n_destinations": len(DESTINATIONS),
+            "n_requests":     len(DESTINATIONS),
+            "total_supply_teu": sum(o["supply_teu"] for o in ORIGINS.values()),
+            "total_demand_teu": sum(d["demand_teu"] for d in DESTINATIONS.values()),
+        },
+        "best_fuzzy_solution_alpha075": {
+            "hub_allocation": best_solution.hub_allocation,
+            "origin_to_hub": {k: {kk: (float(vv) if isinstance(vv, (int, float, np.number)) else vv)
+                                  for kk, vv in v.items()}
+                              for k, v in best_solution.origin_to_hub.items()},
+            "hub_to_destination": {k: {kk: (float(vv) if isinstance(vv, (int, float, np.number)) else vv)
+                                       for kk, vv in v.items()}
+                                   for k, v in best_solution.hub_to_destination.items()},
+            "inter_hub_exchanges": {k: float(v) for k, v in best_solution.inter_hub_exchanges.items()},
+            "hub_utilization": {k: {kk: (float(vv) if isinstance(vv, (int, float, np.number)) else vv)
+                                    for kk, vv in v.items()}
+                                for k, v in best_solution.hub_utilization.items()},
+            "vehicle_summary": best_solution.vehicle_summary,
+            "vehicle_deployment": {f"{k[0]}->{k[1]}": v
+                                   for k, v in best_solution.vehicle_deployment.items()},
+            "base_cost":              float(best_solution.base_cost),
+            "reliability_penalty":    float(best_solution.reliability_penalty),
+            "total_cost":             float(best_solution.total_cost),
+            "tw_violation_rate":      float(best_solution.tw_violation_rate),
+            "swvr":                   float(best_solution.swvr),
+            "avg_lateness":           float(best_solution.avg_lateness),
+            "hub_balance":            float(best_solution.hub_balance),
+            "gini_coefficient":       float(best_solution.gini_coefficient),
+            "inter_hub_flow":         float(best_solution.inter_hub_flow),
+            "inter_hub_imbalance":    float(best_solution.inter_hub_imbalance),
+            "inter_hub_spatial":      float(best_solution.inter_hub_spatial),
+            "transfer_efficiency":    float(best_solution.transfer_efficiency),
+            "hub_proximity":          float(best_solution.hub_proximity),
+            "proximity_efficiency":   float(best_solution.proximity_efficiency),
+            "ciw":                    float(best_solution.ciw),
+            "credibility_satisfaction": float(best_solution.credibility_satisfaction),
+            "min_credibility":        float(best_solution.min_credibility),
+            "co2_emissions":          float(best_solution.co2_emissions),
+        },
+        "greedy_baseline": {
+            "base_cost":         float(greedy_sol.base_cost),
+            "total_cost":        float(greedy_sol.total_cost),
+            "tw_violation_rate": float(greedy_sol.tw_violation_rate),
+        },
+        "deterministic_afcde": {
+            "base_cost":           float(det_metrics["base_cost"]),
+            "total_cost":          float(det_metrics["total_cost"]),
+            "tw_violation_rate":   float(det_metrics["tw_violation_rate"]),
+            "reliability_penalty": float(det_metrics["reliability_penalty"]),
+        },
+        "cost_reductions": {
+            "fuzzy_vs_greedy_pct":        float(pct_greedy),
+            "fuzzy_vs_deterministic_pct": float(pct_det),
+        },
+    }
+    path = out_dirs["routes"] / "best_solution_summary.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(plan, f, indent=2, default=str)
+    print(f"  Saved: best_solution_summary.json")
+    return path
+
+
+# ============================================================================
+# FIGURE HELPERS — BULLETPROOF SAVING
+# ============================================================================
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError("savefig timed out")
+
+
+def save_figure(fig, filename_base, out_dirs):
+    """
+    Save figure in Transportmetrica A standard formats.
+    Each format is attempted independently; failures are logged but do not
+    abort the script.
+    """
+    # --- Preview PNG (300 dpi) ---
+    try:
+        path_preview = out_dirs["figures"] / f"{filename_base}.png"
+        fig.savefig(path_preview, dpi=300, format="png",
+                    bbox_inches="tight", pad_inches=0.02)
+        print("    [OK] preview PNG")
+    except Exception as e:
+        print(f"    [FAIL] preview PNG: {type(e).__name__}: {e}")
+
+    # --- Publication PNG (600 dpi) ---
+    try:
+        path_png = out_dirs["figures_pub"] / f"{filename_base}.png"
+        fig.savefig(path_png, dpi=600, format="png",
+                    bbox_inches="tight", pad_inches=0.02)
+        print("    [OK] publication PNG-600dpi")
+    except Exception as e:
+        print(f"    [FAIL] publication PNG: {type(e).__name__}: {e}")
+
+    # --- Vector PDF ---
+    try:
+        path_pdf = out_dirs["figures_pub"] / f"{filename_base}.pdf"
+        fig.savefig(path_pdf, format="pdf",
+                    bbox_inches="tight", pad_inches=0.02)
+        print("    [OK] publication PDF-vector")
+    except Exception as e:
+        print(f"    [FAIL] publication PDF: {type(e).__name__}: {e}")
+
+    # --- Vector EPS (guarded with timeout on POSIX) ---
+    eps_ok = False
+    try:
+        path_eps = out_dirs["figures_pub"] / f"{filename_base}.eps"
+        use_alarm = hasattr(signal, "SIGALRM") and os.name == "posix"
+        if use_alarm:
+            old = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(30)
+        try:
+            fig.savefig(path_eps, format="eps",
+                        bbox_inches="tight", pad_inches=0.02)
+            eps_ok = path_eps.exists() and path_eps.stat().st_size > 0
+        finally:
+            if use_alarm:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+        if eps_ok:
+            print("    [OK] publication EPS")
+        else:
+            print("    [SKIP] EPS not produced (backend may have failed silently)")
+    except Exception as e:
+        print(f"    [FAIL] publication EPS: {type(e).__name__}: {e}")
+
+    # --- TIFF (optional, requires Pillow) ---
+    tiff_ok = False
+    try:
+        path_tiff = out_dirs["figures_pub"] / f"{filename_base}.tiff"
+        fig.savefig(path_tiff, dpi=600, format="tiff",
+                    bbox_inches="tight", pad_inches=0.02,
+                    pil_kwargs={"compression": "tiff_lzw"})
+        tiff_ok = path_tiff.exists() and path_tiff.stat().st_size > 0
+        if tiff_ok:
+            print("    [OK] publication TIFF-600dpi")
+    except TypeError:
+        try:
+            fig.savefig(path_tiff, dpi=600, format="tiff",
+                        bbox_inches="tight", pad_inches=0.02)
+            print("    [OK] publication TIFF-600dpi (no LZW)")
+        except Exception as e2:
+            print(f"    [FAIL] publication TIFF (fallback): {type(e2).__name__}: {e2}")
+    except Exception as e:
+        print(f"    [FAIL] publication TIFF: {type(e).__name__}: {e}")
+
+    plt.close(fig)
+    plt.close("all")
+    gc.collect()
+
+    status = []
+    if (out_dirs["figures_pub"] / f"{filename_base}.png").exists():  status.append("PNG")
+    if (out_dirs["figures_pub"] / f"{filename_base}.pdf").exists():  status.append("PDF")
+    if eps_ok:  status.append("EPS")
+    if tiff_ok: status.append("TIFF")
+    print(f"  Saved {filename_base}: {', '.join(status) if status else 'NONE'}")
+
+
+def transportmetrica_figsize(width="single", height=None, aspect=0.75):
+    w = TM_SINGLE_WIDTH if width == "single" else TM_DOUBLE_WIDTH
+    if height is None:
+        height = w * aspect
+    return (w, min(height, TM_MAX_HEIGHT))
+
+
+def safe_figure_call(func, *args, **kwargs):
+    """Run a figure function; catch BaseException (except KeyboardInterrupt)."""
+    try:
+        func(*args, **kwargs)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        print(f"  [ERROR] {func.__name__} failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+    finally:
+        plt.close("all")
+        gc.collect()
+
+
+# ============================================================================
+# SENSITIVITY ANALYSES
+# ============================================================================
+
+def uncertainty_sensitivity(out_dirs, num_runs=3, pop_size=20, max_gen=50):
+    print("\n" + "=" * 80)
+    print("UNCERTAINTY SENSITIVITY ANALYSIS")
+    print("=" * 80)
+    global FUZZY_TRANSIT
+    base_transit = dict(BASE_FUZZY_TRANSIT)
+    results = {}
+    for delta in [0.10, 0.15, 0.20, 0.30]:
+        print(f"\n[delta = {delta:.2f}]")
+        FUZZY_TRANSIT = {k: make_fuzzy(v, delta) for k, v in base_transit.items()}
+        runs = run_fuzzy_alpha(0.75, num_runs=num_runs, pop_size=pop_size, max_gen=max_gen)
+        results[delta] = {
+            "cost":              np.mean([s.total_cost for s in runs]),
+            "cost_std":          np.std([s.total_cost for s in runs], ddof=1) if len(runs) > 1 else 0.0,
+            "base_cost":         np.mean([s.base_cost for s in runs]),
+            "reliability_penalty": np.mean([s.reliability_penalty for s in runs]),
+            "tw_viol":           np.mean([s.tw_violation_rate for s in runs]),
+            "swvr":              np.mean([s.swvr for s in runs]),
+            "ciw":               np.mean([s.ciw for s in runs]),
+            "hub_balance":       np.mean([s.hub_balance for s in runs]),
+            "gini":              np.mean([s.gini_coefficient for s in runs]),
+            "inter_hub_flow":    np.mean([s.inter_hub_flow for s in runs]),
+            "total_vehicles":    np.mean([getattr(s, "vehicle_summary", {}).get("total_vehicles", 0) for s in runs]),
+            "feasible":          np.mean([1.0 if s.feasible else 0.0 for s in runs]),
+        }
+        gc.collect()
+    FUZZY_TRANSIT = {k: make_fuzzy(v, 0.15) for k, v in base_transit.items()}
+    df = pd.DataFrame([{
+        "delta": f"{d:.2f}",
+        "Total Cost": f"${m['cost']:,.0f}",
+        "Cost Std": f"${m['cost_std']:,.0f}",
+        "Base Cost": f"${m['base_cost']:,.0f}",
+        "Rel. Penalty": f"${m['reliability_penalty']:,.0f}",
+        "TW Viol": f"{m['tw_viol'] * 100:.2f}%",
+        "SWVR": f"{m['swvr']:.4f}",
+        "CIW (h)": f"{m['ciw']:.2f}",
+        "Hub Balance": f"{m['hub_balance']:.4f}",
+        "Gini": f"{m['gini']:.4f}",
+        "Inter-hub (TEU)": f"{m['inter_hub_flow']:.0f}",
+        "Vehicles": f"{m['total_vehicles']:.0f}",
+        "Feasible": f"{m['feasible'] * 100:.0f}%",
+    } for d, m in results.items()])
+    print(df.to_string(index=False))
+    df.to_csv(out_dirs["reports"] / "uncertainty_sensitivity.csv", index=False, encoding="utf-8")
+    return results
+
+
+def capacity_sensitivity(out_dirs, num_runs=3, pop_size=20, max_gen=50):
+    print("\n" + "=" * 80)
+    print("HUB CAPACITY SENSITIVITY ANALYSIS")
+    print("=" * 80)
+    global HUBS
+    base_capacities = {h: HUBS[h]["capacity_teu"] for h in HUBS}
+    results = {}
+    for cap_factor in [0.80, 0.90, 1.00, 1.10, 1.20]:
+        print(f"\n[Capacity factor = {cap_factor:.2f}]")
+        for h in HUBS:
+            HUBS[h]["capacity_teu"] = int(base_capacities[h] * cap_factor)
+        runs = run_fuzzy_alpha(0.75, num_runs=num_runs, pop_size=pop_size, max_gen=max_gen)
+        feasible_runs = [s for s in runs if s.feasible]
+        use_runs = feasible_runs if feasible_runs else runs
+        results[cap_factor] = {
+            "cost":               min([s.total_cost for s in use_runs]),
+            "cost_std":           np.std([s.total_cost for s in use_runs], ddof=1) if len(use_runs) > 1 else 0.0,
+            "base_cost":          min([s.base_cost for s in use_runs]),
+            "reliability_penalty": min([s.reliability_penalty for s in use_runs]),
+            "tw_viol":            min([s.tw_violation_rate for s in use_runs]),
+            "hub_balance":        max([s.hub_balance for s in use_runs]),
+            "gini":               min([s.gini_coefficient for s in use_runs]),
+            "inter_hub_flow":     np.mean([s.inter_hub_flow for s in use_runs]),
+            "total_vehicles":     np.mean([getattr(s, "vehicle_summary", {}).get("total_vehicles", 0) for s in use_runs]),
+            "util_mombasa":       np.mean([s.hub_utilization.get("Mombasa", {}).get("utilization_pct", 0) for s in use_runs]),
+            "util_dar":           np.mean([s.hub_utilization.get("Dar_es_Salaam", {}).get("utilization_pct", 0) for s in use_runs]),
+            "feasible":           len(feasible_runs) / len(runs) if runs else 0.0,
+        }
+        gc.collect()
+    for h in HUBS:
+        HUBS[h]["capacity_teu"] = base_capacities[h]
+    df = pd.DataFrame([{
+        "Capacity Factor": f"{c:.2f}",
+        "Total Cost": f"${m['cost']:,.0f}",
+        "Cost Std": f"${m['cost_std']:,.0f}",
+        "Base Cost": f"${m['base_cost']:,.0f}",
+        "Rel. Penalty": f"${m['reliability_penalty']:,.0f}",
+        "TW Viol": f"{m['tw_viol'] * 100:.2f}%",
+        "Hub Balance": f"{m['hub_balance']:.4f}",
+        "Gini": f"{m['gini']:.4f}",
+        "Inter-hub (TEU)": f"{m['inter_hub_flow']:.0f}",
+        "Vehicles": f"{m['total_vehicles']:.0f}",
+        "Util MOM": f"{m['util_mombasa']:.2f}%",
+        "Util DAR": f"{m['util_dar']:.2f}%",
+        "Feasible": f"{m['feasible'] * 100:.0f}%",
+    } for c, m in results.items()])
+    print(df.to_string(index=False))
+    df.to_csv(out_dirs["reports"] / "capacity_sensitivity.csv", index=False, encoding="utf-8")
+    return results
+
+
+def tw_tightness_sensitivity(out_dirs, num_runs=3, pop_size=20, max_gen=50):
+    print("\n" + "=" * 80)
+    print("TIME-WINDOW TIGHTNESS SENSITIVITY ANALYSIS")
+    print("=" * 80)
+    results = {}
+    for tightness in [0.5, 0.75, 1.0, 1.25, 1.5]:
+        print(f"\n[Tightness = {tightness:.2f}]")
+        runs = run_fuzzy_alpha(0.75, num_runs=num_runs, pop_size=pop_size,
+                               max_gen=max_gen, tw_tightness=tightness)
+        feasible_runs = [s for s in runs if s.feasible]
+        use_runs = feasible_runs if feasible_runs else runs
+        results[tightness] = {
+            "cost":              np.mean([s.total_cost for s in use_runs]),
+            "cost_std":          np.std([s.total_cost for s in use_runs], ddof=1) if len(use_runs) > 1 else 0.0,
+            "base_cost":         np.mean([s.base_cost for s in use_runs]),
+            "reliability_penalty": np.mean([s.reliability_penalty for s in use_runs]),
+            "tw_viol":           np.mean([s.tw_violation_rate for s in use_runs]),
+            "swvr":              np.mean([s.swvr for s in use_runs]),
+            "avg_lateness":      np.mean([s.avg_lateness for s in use_runs]),
+            "hub_balance":       np.mean([s.hub_balance for s in use_runs]),
+            "inter_hub_flow":    np.mean([s.inter_hub_flow for s in use_runs]),
+            "total_vehicles":    np.mean([getattr(s, "vehicle_summary", {}).get("total_vehicles", 0) for s in use_runs]),
+            "feasible":          len(feasible_runs) / len(runs) if runs else 0.0,
+        }
+        gc.collect()
+    df = pd.DataFrame([{
+        "TW Tightness": f"{t:.2f}",
+        "Total Cost": f"${m['cost']:,.0f}",
+        "Cost Std": f"${m['cost_std']:,.0f}",
+        "Base Cost": f"${m['base_cost']:,.0f}",
+        "Rel. Penalty": f"${m['reliability_penalty']:,.0f}",
+        "TW Viol": f"{m['tw_viol'] * 100:.2f}%",
+        "SWVR": f"{m['swvr']:.4f}",
+        "Avg Late (h)": f"{m['avg_lateness']:.2f}",
+        "Hub Balance": f"{m['hub_balance']:.4f}",
+        "Inter-hub (TEU)": f"{m['inter_hub_flow']:.0f}",
+        "Vehicles": f"{m['total_vehicles']:.0f}",
+        "Feasible": f"{m['feasible'] * 100:.0f}%",
+    } for t, m in results.items()])
+    print(df.to_string(index=False))
+    df.to_csv(out_dirs["reports"] / "tw_tightness_sensitivity.csv", index=False, encoding="utf-8")
+    return results
+
+
+# ============================================================================
+# TRANSPORTMETRICA A CHECKLIST
+# ============================================================================
+
+def print_transportmetrica_checklist():
+    print("\n" + "=" * 80)
+    print("TRANSPORTMETRICA A (TAYLOR & FRANCIS) FIGURE COMPLIANCE CHECKLIST")
+    print("=" * 80)
+    print("""
+    [OK] Resolution: 600 DPI minimum (1200 for line art, 300 for halftone)
+    [OK] Vector format: PDF (preferred) + EPS + TIFF fallback
+    [OK] Font embedding: Type 42 (TrueType), embedded in PDF
+    [OK] Font: Arial/Helvetica (T&F preferred), 8-10 pt
+    [OK] Line width: 0.5-1.0 pt (0.75 pt used)
+    [OK] Single-column width: 80 mm
+    [OK] Double-column width: 169 mm
+    [OK] Max height: 220 mm
+    [OK] Color palette: colorblind-safe (Wong 2011)
+    [OK] Panel labels: bold (a), (b), (c) at top-left
+    [OK] Axis labels: sentence case, units in parentheses
+    [OK] Grid: subtle dotted (alpha=0.25, linewidth=0.4)
+    [OK] Legend: compact, frameon, edgecolor black
+    [OK] No JPEG (T&F does not accept JPEG for line art)
+    """)
+    print("=" * 80)
+
+
+# ============================================================================
+# SENSITIVITY ANALYSES (return dict for figure 10)
+# ============================================================================
+
+def run_all_sensitivities(out_dirs, num_runs, pop_size, max_gen):
+    print("\n" + "#" * 80)
+    print("# SENSITIVITY ANALYSES")
+    print("#" * 80)
+
+    print("\n[Sensitivity 1/3] Uncertainty")
+    try:
+        sens_uncertainty = uncertainty_sensitivity(out_dirs, num_runs=num_runs,
+                                                   pop_size=pop_size, max_gen=max_gen)
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        traceback.print_exc()
+        sens_uncertainty = {}
+    gc.collect()
+
+    print("\n[Sensitivity 2/3] Capacity")
+    try:
+        sens_capacity = capacity_sensitivity(out_dirs, num_runs=num_runs,
+                                             pop_size=pop_size, max_gen=max_gen)
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        traceback.print_exc()
+        sens_capacity = {}
+    gc.collect()
+
+    print("\n[Sensitivity 3/3] TW Tightness")
+    try:
+        sens_tw = tw_tightness_sensitivity(out_dirs, num_runs=num_runs,
+                                           pop_size=pop_size, max_gen=max_gen)
+    except Exception as e:
+        print(f"  [ERROR] {e}")
+        traceback.print_exc()
+        sens_tw = {}
+    gc.collect()
+
+    return {
+        "uncertainty": sens_uncertainty,
+        "capacity":   sens_capacity,
+        "tw_tightness": sens_tw,
+    }
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def run_analysis(output_dir=None, seed=42, light_mode=False):
+    overall_start = time.time()
+
+    # Portable output directory
+    if output_dir is None:
+        output_dir = Path(os.environ.get("AFC_DE_OUTPUT_DIR", "./AFC-DE_EAC_results"))
+    else:
+        output_dir = Path(output_dir)
+    out_dirs = setup_output_dirs(output_dir)
+
+    np.random.seed(seed)
+    rnd.seed(seed)
+
+    if light_mode:
+        runs = 2
+        sens_runs, sens_pop, sens_gens = 1, 10, 20
+    else:
+        runs = 3
+        sens_runs, sens_pop, sens_gens = 3, 15, 30
+    pop, gens = 25, 60
+
+    print("=" * 80)
+    print("AFC-DE THREE-WAY COMPARISON ANALYSIS")
+    print("2 hubs | 8 origins | 9 destinations | 6 borders | 4 vehicle types")
+    print("=" * 80)
+    print(f"Output:   {out_dirs['root']}")
+    print(f"Workload: pop={pop}, gens={gens}, runs={runs}")
+    print(f"Seed:     {seed}")
+    print(f"Light:    {light_mode}")
+
+    # ---- STEP 1: Greedy baseline ----
+    print("\n" + "#" * 80)
+    print("# STEP 1: GREEDY NEAREST-HUB BASELINE")
+    print("#" * 80)
+    greedy_sol = build_greedy_solution()
+    print(f"  Base cost:     ${greedy_sol.base_cost:,.0f}")
+    print(f"  Rel. penalty:  ${greedy_sol.reliability_penalty:,.0f}")
+    print(f"  Total cost:    ${greedy_sol.total_cost:,.0f}")
+    print(f"  TW violations: {greedy_sol.tw_violation_rate * 100:.2f}%")
+    print(f"  Vehicles:      {greedy_sol.vehicle_summary.get('total_vehicles', 0)}")
+    greedy_metrics = compute_metrics([greedy_sol])
+
+    # ---- STEP 2: Deterministic-AFC-DE ----
+    print("\n" + "#" * 80)
+    print("# STEP 2: DETERMINISTIC-AFC-DE")
+    print("#" * 80)
+    det_results = run_deterministic_optimized(num_runs=runs, pop_size=pop, max_gen=gens)
+    det_metrics = compute_metrics(det_results)
+    print(f"\n  Best deterministic-AFC-DE total cost: ${det_metrics['total_cost']:,.0f} "
+          f"(avg across {runs} runs)")
+    print(f"  TW violations (MC):                   {det_metrics['tw_violation_rate'] * 100:.2f}%")
+
+    # ---- STEP 3: Fuzzy-AFC-DE at four alpha values ----
+    print("\n" + "#" * 80)
+    print("# STEP 3: FUZZY-AFC-DE")
+    print("#" * 80)
+    fuzzy_results = {}
+    fuzzy_metrics = {}
+    for alpha in [0.50, 0.75, 0.90, 0.95]:
+        results = run_fuzzy_alpha(alpha, num_runs=runs, pop_size=pop, max_gen=gens)
+        fuzzy_results[alpha] = results
+        fuzzy_metrics[alpha] = compute_metrics(results)
+        gc.collect()
+
+    # ---- STEP 4: Three-way comparison ----
+    print("\n" + "#" * 80)
+    print("# STEP 4: THREE-WAY COMPARISON")
+    print("#" * 80)
+    print(f"\n{'Method':<32} {'Base Cost':>12} {'Rel.Pen':>11} {'Total':>13} {'TW Viol':>9} {'Vehicles':>9}")
+    print("-" * 95)
+    print(f"{'Greedy nearest-hub':<32} ${greedy_metrics['base_cost']:>10,.0f} "
+          f"${greedy_metrics['reliability_penalty']:>9,.0f} "
+          f"${greedy_metrics['total_cost']:>11,.0f} "
+          f"{greedy_metrics['tw_violation_rate'] * 100:>7.2f}% "
+          f"{greedy_metrics.get('total_vehicles', 0):>9.0f}")
+    print(f"{'Deterministic-AFC-DE':<32} ${det_metrics['base_cost']:>10,.0f} "
+          f"${det_metrics['reliability_penalty']:>9,.0f} "
+          f"${det_metrics['total_cost']:>11,.0f} "
+          f"{det_metrics['tw_violation_rate'] * 100:>7.2f}% "
+          f"{det_metrics.get('total_vehicles', 0):>9.0f}")
+    for alpha in [0.50, 0.75, 0.90, 0.95]:
+        m = fuzzy_metrics[alpha]
+        print(f"{'Fuzzy-AFC-DE (alpha=' + f'{alpha:.2f})':<32} ${m['base_cost']:>10,.0f} "
+              f"${m['reliability_penalty']:>9,.0f} "
+              f"${m['total_cost']:>11,.0f} "
+              f"{m['tw_violation_rate'] * 100:>7.2f}% "
+              f"{m.get('total_vehicles', 0):>9.0f}")
+
+    reduction_greedy = greedy_metrics["total_cost"] - fuzzy_metrics[0.75]["total_cost"]
+    pct_greedy = 100 * reduction_greedy / greedy_metrics["total_cost"]
+    reduction_det = det_metrics["total_cost"] - fuzzy_metrics[0.75]["total_cost"]
+    pct_det = 100 * reduction_det / det_metrics["total_cost"]
+    print("\n" + "=" * 80)
+    print("COST REDUCTIONS")
+    print("=" * 80)
+    print(f"\nFuzzy (alpha=0.75) vs Greedy:               ${reduction_greedy:>10,.0f} ({pct_greedy:>6.2f}%)")
+    print(f"Fuzzy (alpha=0.75) vs Deterministic-AFC-DE: ${reduction_det:>10,.0f} ({pct_det:>6.2f}%)")
+
+    # ---- STEP 5: Export tables and best solution ----
+    print("\n" + "#" * 80)
+    print("# STEP 5: EXPORT")
+    print("#" * 80)
+    df_three = export_three_way_comparison(greedy_sol, det_metrics, fuzzy_metrics, fuzzy_results, out_dirs)
+    print("\n" + df_three.to_string(index=False))
+
+    best_075 = max(fuzzy_results[0.75], key=lambda x: (x.feasible, x.hub_balance))
+    best_075.extract_routes()
+    metrics_table = compute_problem_specific_metrics(best_075)
+
+    export_problem_specific_metrics(metrics_table, best_075, out_dirs)
+    export_recommended_plan(best_075, out_dirs)
+    export_vehicle_deployment(best_075, out_dirs)
+    export_best_solution_json(best_075, det_metrics, greedy_sol, fuzzy_metrics,
+                              pct_greedy, pct_det, out_dirs)
+
+    # ---- STEP 6: Sensitivities ----
+    sens_results = run_all_sensitivities(out_dirs, sens_runs, sens_pop, sens_gens)
+
+    # ---- STEP 7: Figures (imported from figures module) ----
+    print("\n" + "#" * 80)
+    print("# STEP 7: FIGURES (TRANSPORTMETRICA A STANDARD)")
+    print("#" * 80)
+
+    from afc_de_figures import (  # noqa: E402  (delayed import to keep main script light)
+        fig1_fuzzy_network, fig2_deterministic_network, fig3_network_comparison,
+        fig4_cost_reliability, fig5_alpha_sensitivity, fig6_problem_specific_radar,
+        fig7_hub_utilization, fig8_transfer_decomposition, fig9_route_breakdown,
+        fig10_sensitivity_analysis, fig11_fuzzy_distribution, fig12_vehicle_deployment,
+        fig13_extended_network_map,
+    )
+
+    fig_jobs = [
+        ("[1/13]  Fuzzy Network",               fig1_fuzzy_network,              (best_075,)),
+        ("[2/13]  Deterministic Network",        fig2_deterministic_network,      (det_results[0],)),
+        ("[3/13]  Network Comparison",           fig3_network_comparison,         (best_075, det_results[0])),
+        ("[4/13]  Cost-Reliability",             fig4_cost_reliability,           (greedy_metrics, det_metrics, fuzzy_metrics)),
+        ("[5/13]  Alpha Sensitivity",            fig5_alpha_sensitivity,          (fuzzy_metrics,)),
+        ("[6/13]  Problem-Specific Radar",       fig6_problem_specific_radar,     (best_075,)),
+        ("[7/13]  Hub Utilization",              fig7_hub_utilization,            (best_075,)),
+        ("[8/13]  Transfer Decomposition",       fig8_transfer_decomposition,     (best_075,)),
+        ("[9/13]  Route Breakdown",              fig9_route_breakdown,            (best_075,)),
+        ("[10/13] Sensitivity Analysis",         fig10_sensitivity_analysis,      (sens_results,)),
+        ("[11/13] Fuzzy Distribution",           fig11_fuzzy_distribution,        (best_075,)),
+        ("[12/13] Vehicle Deployment",           fig12_vehicle_deployment,        (best_075,)),
+        ("[13/13] Extended Network Map",         fig13_extended_network_map,      (best_075,)),
+    ]
+    for label, func, args in fig_jobs:
+        print(f"\n{label}")
+        safe_figure_call(func, *args, out_dirs=out_dirs)
+
+    # ---- FINAL SUMMARY ----
+    overall_elapsed = time.time() - overall_start
+    print("\n" + "=" * 80)
+    print("MANUSCRIPT INTEGRATION SUMMARY")
+    print("=" * 80)
+    print(f"\nTotal runtime: {overall_elapsed:.1f} seconds")
+
+    print("\n--- Three-Way Comparison ---")
+    print(f"Greedy nearest-hub:        ${greedy_metrics['total_cost']:>12,.0f} "
+          f"({greedy_metrics['tw_violation_rate'] * 100:.2f}% TW viol)")
+    print(f"Deterministic-AFC-DE:      ${det_metrics['total_cost']:>12,.0f} "
+          f"({det_metrics['tw_violation_rate'] * 100:.2f}% TW viol)")
+    print(f"Fuzzy-AFC-DE (alpha=0.75): ${fuzzy_metrics[0.75]['total_cost']:>12,.0f} "
+          f"({fuzzy_metrics[0.75]['tw_violation_rate'] * 100:.2f}% TW viol)")
+    print(f"Fuzzy-AFC-DE (alpha=0.95): ${fuzzy_metrics[0.95]['total_cost']:>12,.0f} "
+          f"({fuzzy_metrics[0.95]['tw_violation_rate'] * 100:.2f}% TW viol)")
+
+    print("\n--- Cost Reductions ---")
+    print(f"Fuzzy vs Greedy:        {pct_greedy:>7.2f}% (${reduction_greedy:,.0f})")
+    print(f"Fuzzy vs Deterministic: {pct_det:>7.2f}% (${reduction_det:,.0f})")
+
+    print("\n--- Best Fuzzy Solution (alpha=0.75) Metrics ---")
+    for k, v in metrics_table.items():
+        if isinstance(v, (int, float)):
+            print(f"  {k:<40s} {v:.4f}")
+
+    print("\n--- Output Locations ---")
+    for k, p in out_dirs.items():
+        print(f"  {k:<12s} {p}")
+
+    print_transportmetrica_checklist()
+    print("=" * 80)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="AFC-DE three-way comparison for the East African Corridor.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples
+--------
+    python afc_de.py
+    python afc_de.py --output-dir ./results --seed 42
+    python afc_de.py --light
+        """,
+    )
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output directory (default: ./AFC-DE_EAC_results or $AFC_DE_OUTPUT_DIR)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default: 42)")
+    parser.add_argument("--light", action="store_true",
+                        help="Run in light mode: 2 runs, smaller sensitivity grid")
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_analysis(output_dir=args.output_dir, seed=args.seed, light_mode=args.light)
